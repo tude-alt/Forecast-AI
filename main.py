@@ -270,7 +270,7 @@ if __name__ == "__main__":
     try:
         if run_mode == "tournament":
             logger.info("Running in tournament mode...")
-            tournament_ids_to_run = args.tournament_ids or ['32813', 'minibench', MetaculusApi.CURRENT_MINIBENCH_ID]
+            tournament_ids_to_run = args.tournament_ids or ['32813', 'market-pulse-25q4', MetaculusApi.CURRENT_MINIBENCH_ID]
             logger.info(f"Targeting tournaments: {tournament_ids_to_run}")
             all_reports = []
             for tournament_id in tournament_ids_to_run:
