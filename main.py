@@ -1,5 +1,5 @@
 # main.py
-# Hybrid Pre-Mortem Forecasting Bot — Tournament-Only, Validation-Compliant
+# Hybrid Pre-Mortem Forecasting Bot — Tournament-Only, Fully Validation-Compliant
 
 import argparse
 import asyncio
@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import warnings
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import numpy as np
 import requests
@@ -157,7 +157,7 @@ class HybridPreMortemBot(ForecastBot):
             return await self.get_llm("research_synthesizer", "llm").invoke(synthesis_prompt)
 
     # -----------------------------
-    # Forecasting Pipelines — STRICTLY COMPLIANT
+    # Forecasting Pipelines — FULLY COMPLIANT
     # -----------------------------
     async def _single_binary_forecast(self, synthesizer_key: str, question: BinaryQuestion, context: str) -> Dict[str, Any]:
         prompt = clean_indents(f"""
@@ -239,7 +239,7 @@ class HybridPreMortemBot(ForecastBot):
         forecasts = await asyncio.gather(*[self._single_binary_forecast(k, question, context) for k in synthesizers])
         median_prob = float(np.median([f["probability"] for f in forecasts]))
         reasoning = " | ".join([f["reasoning"] for f in forecasts])
-        # ✅ CORRECT FIELD NAME: prediction_in_decimal
+        # ✅ CORRECT FIELD NAME
         forecast = BinaryPrediction(prediction_in_decimal=median_prob)
         return ReasonedPrediction(forecast=forecast, reasoning=reasoning)
 
@@ -278,31 +278,38 @@ class HybridPreMortemBot(ForecastBot):
             median_val = float(np.median(values))
             aggregated_percentiles.append(Percentile(percentile=p / 100.0, value=median_val))
         
-        # ✅ Infer bounds from question semantics
+        # ✅ Infer bounds and zero_point
         question_text = question.question_text.lower()
         if "yield" in question_text or "spread" in question_text:
+            # UST Yield or HY Spread: bounded below by 0%
             open_lower_bound = False
-            lower_bound: Optional[float] = 0.0
+            lower_bound = 0.0
             open_upper_bound = True
-            upper_bound: Optional[float] = None
+            upper_bound = 100.0
+            zero_point = 0.0
         elif "exceed" in question_text and ("return" in question_text or "stock" in question_text):
+            # Relative returns: unbounded, zero_point = 0.0
             open_lower_bound = True
             open_upper_bound = True
-            lower_bound = None
-            upper_bound = None
+            lower_bound = -1000.0   # Sentinel for -inf
+            upper_bound = 1000.0    # Sentinel for +inf
+            zero_point = 0.0
         else:
+            # Default unbounded
             open_lower_bound = True
             open_upper_bound = True
-            lower_bound = None
-            upper_bound = None
+            lower_bound = -1000.0
+            upper_bound = 1000.0
+            zero_point = 0.0
 
-        # ✅ CORRECT CONSTRUCTION: ALL 5 FIELDS, CORRECT NAMES
+        # ✅ ALL 6 FIELDS — NO None, ALL floats
         distribution = NumericDistribution(
             declared_percentiles=aggregated_percentiles,
             open_lower_bound=open_lower_bound,
             open_upper_bound=open_upper_bound,
             lower_bound=lower_bound,
             upper_bound=upper_bound,
+            zero_point=zero_point,
         )
         reasoning = " | ".join([f["reasoning"] for f in forecasts])
         return ReasonedPrediction(forecast=distribution, reasoning=reasoning)
