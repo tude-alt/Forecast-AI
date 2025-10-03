@@ -1,8 +1,11 @@
+# main.py
 # A forecasting bot using a hybrid of tailored, median-aggregated analytical techniques.
+
 import argparse
 import asyncio
 import logging
 import os
+import warnings
 from datetime import datetime
 from typing import Literal
 
@@ -17,13 +20,13 @@ from forecasting_tools import (
     MetaculusQuestion,
     ReasonedPrediction,
     clean_indents,
-    structure_output,
     MultipleChoiceQuestion,
     NumericQuestion,
     PredictedOptionList,
     NumericDistribution,
     Percentile,
 )
+
 from tavily import TavilyClient
 from newsapi import NewsApiClient
 
@@ -42,6 +45,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("HybridPreMortemBot")
+
+# -----------------------------
+# Suppress noisy warnings
+# -----------------------------
+warnings.filterwarnings("ignore", message=".*does not support cost tracking.*")
 
 
 class HybridPreMortemBot(ForecastBot):
@@ -78,7 +86,9 @@ class HybridPreMortemBot(ForecastBot):
             raise ValueError("No synthesizer models found in LLM configuration.")
         logger.info(f"Initialized with Hybrid analysis pipeline and a committee of {len(self.synthesizer_keys)} synthesizers.")
 
-    # --- All-Source Research (Used by all question types) ---
+    # -----------------------------
+    # External Research Methods
+    # -----------------------------
     def call_tavily(self, query: str) -> str:
         if not self.tavily_client.api_key: return "Tavily search not performed."
         try:
@@ -121,54 +131,58 @@ class HybridPreMortemBot(ForecastBot):
             raw_research_dump = ""
             for i, result in enumerate(results):
                 raw_research_dump += f"--- RAW DATA FROM: {source_names[i].upper()} ---\n{result}\n\n"
-            synthesis_prompt = clean_indents(f"""You are a senior intelligence analyst. Your job is to synthesize raw, potentially redundant data from multiple sources into a single, clean, and comprehensive briefing for a team of superforecasters. Raw Data Dump: {raw_research_dump} Synthesized Intelligence Briefing:""")
+            synthesis_prompt = clean_indents(f"""
+            You are a senior intelligence analyst. Your job is to synthesize raw, potentially redundant 
+            data from multiple sources into a single, clean, and comprehensive briefing for a team of superforecasters.  
+
+            Raw Data Dump:
+            {raw_research_dump}
+
+            Synthesized Intelligence Briefing:
+            """)
             final_briefing = await self.get_llm("research_synthesizer", "llm").invoke(synthesis_prompt)
             logger.info(f"--- All-Source Research Complete for Q {question.page_url} ---")
             return final_briefing
 
-    # --- FORECASTING LOGIC FOR EACH QUESTION TYPE ---
-    # (unchanged methods for binary, multiple choice, numeric)
-    # ... omitted for brevity ...
+    # -----------------------------
+    # Forecast Pipelines (wrappers)
+    # -----------------------------
+    async def _forecast_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction:
+        # placeholder logic — you’ll plug in your scenario analysis here
+        forecast = BinaryPrediction(probability_yes=0.5)
+        return ReasonedPrediction(forecast=forecast, reasoning=f"Stub forecast for binary Q: {question.question_text}")
 
-    # --- Comment Formatting Helpers ---
-    def _format_pre_mortem_comment(self, failure_narrative, success_narrative, risk_list, synth_reasonings) -> str:
-        """Format the commentary for binary (yes/no) forecasts."""
-        comment = "--- SCENARIO ANALYSIS STAGE ---\n\n"
-        comment += f"--- Pre-Mortem Narrative (Case for NO) from {self._llms['pre_mortem_agent'].model} ---\n\n{failure_narrative}\n\n"
-        comment += f"--- Pre-Parade Narrative (Case for YES) from {self._llms['pre_parade_agent'].model} ---\n\n{success_narrative}\n\n"
-        comment += f"--- Synthesized Risks & Opportunities from {self._llms['risk_synthesizer'].model} ---\n\n{risk_list}\n\n"
-        comment += "--- FINAL JUDGMENT STAGE ---\n\n"
-        for agent_key, reasoning in synth_reasonings.items():
-            model_name = self._llms[agent_key].model
-            comment += f"--- Final Analysis from {agent_key} ({model_name}) ---\n\n"
-            comment += f"ERROR: {reasoning}\n\n" if isinstance(reasoning, Exception) else f"{reasoning}\n\n"
-        return comment
+    async def _forecast_mc(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction:
+        # placeholder logic
+        probs = [1.0 / len(question.options)] * len(question.options)
+        forecast = PredictedOptionList([{"option": o, "probability": p} for o, p in zip(question.options, probs)])
+        return ReasonedPrediction(forecast=forecast, reasoning=f"Stub forecast for MC Q: {question.question_text}")
 
-    def _format_mc_comment(self, all_arguments, synth_reasonings) -> str:
-        """Format the commentary for multiple-choice forecasts."""
-        comment = "--- ADVOCATE ANALYSIS STAGE ---\n\n"
-        comment += all_arguments
-        comment += "--- FINAL JUDGMENT STAGE ---\n\n"
-        for agent_key, reasoning in synth_reasonings.items():
-            model_name = self._llms[agent_key].model
-            comment += f"--- Final Analysis from {agent_key} ({model_name}) ---\n\n"
-            comment += f"ERROR: {reasoning}\n\n" if isinstance(reasoning, Exception) else f"{reasoning}\n\n"
-        return comment
+    async def _forecast_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction:
+        # placeholder logic
+        distribution = NumericDistribution([
+            Percentile(10, 0.1),
+            Percentile(50, 0.5),
+            Percentile(90, 0.9),
+        ])
+        return ReasonedPrediction(forecast=distribution, reasoning=f"Stub forecast for numeric Q: {question.question_text}")
 
-    def _format_numeric_comment(self, low_narrative, high_narrative, upside_downside_list, synth_reasonings) -> str:
-        """Format the commentary for numeric forecasts."""
-        comment = "--- HIGH/LOW SCENARIO STAGE ---\n\n"
-        comment += f"--- Low Outcome Narrative from {self._llms['pre_mortem_agent'].model} ---\n\n{low_narrative}\n\n"
-        comment += f"--- High Outcome Narrative from {self._llms['pre_parade_agent'].model} ---\n\n{high_narrative}\n\n"
-        comment += f"--- Synthesized Factors from {self._llms['risk_synthesizer'].model} ---\n\n{upside_downside_list}\n\n"
-        comment += "--- FINAL JUDGMENT STAGE ---\n\n"
-        for agent_key, reasoning in synth_reasonings.items():
-            model_name = self._llms[agent_key].model
-            comment += f"--- Final Analysis from {agent_key} ({model_name}) ---\n\n"
-            comment += f"ERROR: {reasoning}\n\n" if isinstance(reasoning, Exception) else f"{reasoning}\n\n"
-        return comment
+    # -----------------------------
+    # Abstract method implementations (required by ForecastBot)
+    # -----------------------------
+    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction:
+        return await self._forecast_binary(question, research)
+
+    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction:
+        return await self._forecast_mc(question, research)
+
+    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction:
+        return await self._forecast_numeric(question, research)
 
 
+# -----------------------------
+# Entrypoint
+# -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Hybrid Pre-Mortem Bot.")
     parser.add_argument("--mode", type=str, choices=["tournament", "test_questions"], default="tournament")
