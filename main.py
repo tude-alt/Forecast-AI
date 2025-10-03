@@ -62,6 +62,24 @@ class HybridPreMortemBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
+    def _llm_config_defaults(self) -> dict[str, str]:
+        """Provide defaults for all LLM roles used internally or expected by base class."""
+        return {
+            # Base class expected roles (to suppress warnings)
+            "summarizer": "openrouter/openai/gpt-4o-mini",
+            "researcher": "openrouter/openai/gpt-4o-search-preview",
+            # Custom pipeline roles
+            "online_researcher": "openrouter/perplexity/llama-3-sonar-large-32k-online",
+            "research_synthesizer": "openrouter/openai/gpt-4o",
+            "pre_mortem_agent": "openrouter/openai/gpt-5",
+            "pre_parade_agent": "openrouter/openai/gpt-4.1",
+            "advocate_agent": "openrouter/openai/gpt-4.1-nano",
+            "risk_synthesizer": "openrouter/openai/gpt-5",
+            "synthesizer_1": "openrouter/openai/o3",
+            "synthesizer_2": "openrouter/openai/gpt-5",
+            "synthesizer_3": "openrouter/anthropic/claude-sonnet-4",
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
@@ -92,7 +110,7 @@ class HybridPreMortemBot(ForecastBot):
 
     def call_serpapi(self, query: str) -> str:
         if not self.serpapi_key: return "SerpApi search not performed."
-        url = "https://serpapi.com/search.json"  # FIXED: removed trailing space
+        url = "https://serpapi.com/search.json"  # Fixed: no trailing space
         params = {"q": query, "api_key": self.serpapi_key}
         try:
             response = requests.get(url, params=params)
@@ -149,7 +167,7 @@ class HybridPreMortemBot(ForecastBot):
         try:
             parsed = json.loads(response.strip())
             prob = float(parsed["probability"])
-            prob = max(0.0, min(1.0, prob))  # clamp
+            prob = max(0.0, min(1.0, prob))
             return {"probability": prob, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
             logger.warning(f"Synthesizer {synthesizer_key} returned invalid JSON: {e}. Using 0.5 as fallback.")
@@ -177,7 +195,7 @@ class HybridPreMortemBot(ForecastBot):
             if total == 0:
                 probs = [1.0 / len(probs)] * len(probs)
             else:
-                probs = [p / total for p in probs]  # renormalize
+                probs = [p / total for p in probs]
             return {"probabilities": probs, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
             logger.warning(f"Synthesizer {synthesizer_key} MC parsing failed: {e}. Uniform fallback.")
@@ -185,11 +203,14 @@ class HybridPreMortemBot(ForecastBot):
             return {"probabilities": uniform, "reasoning": "Fallback due to parsing error."}
 
     async def _single_numeric_forecast(self, synthesizer_key: str, question: NumericQuestion, research: str) -> Dict[str, Any]:
+        # Safely get unit info; fallback if not available
+        unit_info = getattr(question, 'unit', getattr(question, 'units', 'Not specified'))
+
         prompt = clean_indents(f"""
         You are a superforecaster. Provide 10th, 50th (median), and 90th percentiles for the numeric outcome.
 
         Question: {question.question_text}
-        Units: {question.unit or 'N/A'}
+        Units or context: {unit_info}
         Briefing: {research}
 
         Respond ONLY with a JSON object like:
@@ -205,7 +226,14 @@ class HybridPreMortemBot(ForecastBot):
             return {"percentiles": percentiles, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
             logger.warning(f"Synthesizer {synthesizer_key} numeric parsing failed: {e}. Using default.")
-            return {"percentiles": [{"percentile": 10, "value": 0.1}, {"percentile": 50, "value": 0.5}, {"percentile": 90, "value": 0.9}], "reasoning": "Fallback."}
+            return {
+                "percentiles": [
+                    {"percentile": 10, "value": 0.1},
+                    {"percentile": 50, "value": 0.5},
+                    {"percentile": 90, "value": 0.9}
+                ],
+                "reasoning": "Fallback due to parsing or attribute error."
+            }
 
     # -----------------------------
     # Median-Aggregated Forecast Pipelines
@@ -226,7 +254,7 @@ class HybridPreMortemBot(ForecastBot):
             self._single_mc_forecast(key, question, research)
             for key in self.synthesizer_keys
         ])
-        all_probs = np.array([f["probabilities"] for f in forecasts])  # shape: (N, K)
+        all_probs = np.array([f["probabilities"] for f in forecasts])
         median_probs = np.median(all_probs, axis=0)
         total = median_probs.sum()
         if total > 0:
@@ -246,7 +274,6 @@ class HybridPreMortemBot(ForecastBot):
             self._single_numeric_forecast(key, question, research)
             for key in self.synthesizer_keys
         ])
-        # Aggregate by percentile
         target_percentiles = [10, 50, 90]
         aggregated = []
         for p in target_percentiles:
@@ -257,7 +284,7 @@ class HybridPreMortemBot(ForecastBot):
                         values.append(item["value"])
                         break
                 else:
-                    values.append(0.0)  # fallback
+                    values.append(0.0)
             median_val = float(np.median(values))
             aggregated.append(Percentile(percentile=p, value=median_val))
         distribution = NumericDistribution(aggregated)
@@ -292,19 +319,7 @@ if __name__ == "__main__":
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        llms={
-            "default": GeneralLlm(model="openrouter/openai/gpt-5"),
-            "parser": GeneralLlm(model="openrouter/openai/gpt-4o"),
-            "online_researcher": GeneralLlm(model="openrouter/perplexity/llama-3-sonar-large-32k-online"),
-            "research_synthesizer": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
-            "pre_mortem_agent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.5),
-            "pre_parade_agent": GeneralLlm(model="openrouter/openai/gpt-4.1", temperature=0.5),
-            "advocate_agent": GeneralLlm(model="openrouter/openai/gpt-4.1-nano", temperature=0.4),
-            "risk_synthesizer": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.1),
-            "synthesizer_1": GeneralLlm(model="openrouter/openai/o3", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.2),
-            "synthesizer_3": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4", temperature=0.2),
-        },
+        # llms dict is optional now since _llm_config_defaults covers all
     )
 
     try:
@@ -319,9 +334,14 @@ if __name__ == "__main__":
             forecast_reports = all_reports
         elif run_mode == "test_questions":
             logger.info("Running in test questions mode...")
-            # FIXED: removed trailing space in URL
-            EXAMPLE_QUESTIONS = ["https://www.metaculus.com/questions/578/human-extinction-by-2100/"]
-            questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
+            # FIXED: no trailing space in URL
+            EXAMPLE_QUESTIONS = [
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+                "https://www.metaculus.com/questions/40046/",
+                "https://www.metaculus.com/questions/40045/",
+                "https://www.metaculus.com/questions/40038/",
+            ]
+            questions = [MetaculusApi.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTIONS]
             forecast_reports = asyncio.run(all_source_bot.forecast_questions(questions, return_exceptions=True))
         all_source_bot.log_report_summary(forecast_reports)
         logger.info("Run finished successfully.")
