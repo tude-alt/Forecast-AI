@@ -73,7 +73,7 @@ class HybridPreMortemBot(ForecastBot):
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.serpapi_key = SERPAPI_API_KEY
-        self.synthesizer_keys = [k for k in self.llms.keys() if k.startswith("synthesizer")]
+        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
         if not self.synthesizer_keys:
             raise ValueError("No synthesizer models found in LLM configuration.")
         logger.info(f"Initialized with Hybrid analysis pipeline and a committee of {len(self.synthesizer_keys)} synthesizers.")
@@ -254,7 +254,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
-            "default": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
+            "default": GeneralLlm(model="openrouter/openai/gpt-5"),
             "parser": GeneralLlm(model="openrouter/openai/gpt-4o"),
             "online_researcher": GeneralLlm(model="openrouter/perplexity/llama-3-sonar-large-32k-online"),
             "research_synthesizer": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     try:
         if run_mode == "tournament":
             logger.info("Running in tournament mode...")
-            tournament_ids_to_run = args.tournament_ids or ['32813', MetaculusApi.CURRENT_MINIBENCH_ID]
+            tournament_ids_to_run = args.tournament_ids or ['32813', 'minibench', MetaculusApi.CURRENT_MINIBENCH_ID]
             logger.info(f"Targeting tournaments: {tournament_ids_to_run}")
             all_reports = []
             for tournament_id in tournament_ids_to_run:
