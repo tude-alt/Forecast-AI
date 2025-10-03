@@ -1,5 +1,5 @@
 # main.py
-# Hybrid Pre-Mortem Forecasting Bot — Tournament-Only Mode
+# Hybrid Pre-Mortem Forecasting Bot — Tournament-Only, Validation-Compliant
 
 import argparse
 import asyncio
@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import warnings
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import requests
@@ -54,7 +54,7 @@ warnings.filterwarnings("ignore", message=".*does not support cost tracking.*")
 
 class HybridPreMortemBot(ForecastBot):
     """
-    Tournament-only forecasting bot with pre-mortem analysis and domain-aware model routing.
+    Tournament-only bot with strict compliance to forecasting_tools schema.
     """
 
     _max_concurrent_questions = 1
@@ -157,7 +157,7 @@ class HybridPreMortemBot(ForecastBot):
             return await self.get_llm("research_synthesizer", "llm").invoke(synthesis_prompt)
 
     # -----------------------------
-    # Forecasting Pipelines
+    # Forecasting Pipelines — STRICTLY COMPLIANT
     # -----------------------------
     async def _single_binary_forecast(self, synthesizer_key: str, question: BinaryQuestion, context: str) -> Dict[str, Any]:
         prompt = clean_indents(f"""
@@ -239,7 +239,9 @@ class HybridPreMortemBot(ForecastBot):
         forecasts = await asyncio.gather(*[self._single_binary_forecast(k, question, context) for k in synthesizers])
         median_prob = float(np.median([f["probability"] for f in forecasts]))
         reasoning = " | ".join([f["reasoning"] for f in forecasts])
-        return ReasonedPrediction(forecast=BinaryPrediction(probability_yes=median_prob), reasoning=reasoning)
+        # ✅ CORRECT FIELD NAME: prediction_in_decimal
+        forecast = BinaryPrediction(prediction_in_decimal=median_prob)
+        return ReasonedPrediction(forecast=forecast, reasoning=reasoning)
 
     async def _forecast_mc(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction:
         premortem = await self._run_premortem_analysis(question, research)
@@ -253,7 +255,9 @@ class HybridPreMortemBot(ForecastBot):
         else:
             median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
         forecast_list = [{"option": opt, "probability": float(p)} for opt, p in zip(question.options, median_probs)]
-        return ReasonedPrediction(forecast=PredictedOptionList(forecast_list), reasoning=" | ".join([f["reasoning"] for f in forecasts]))
+        forecast = PredictedOptionList(forecast_list)
+        reasoning = " | ".join([f["reasoning"] for f in forecasts])
+        return ReasonedPrediction(forecast=forecast, reasoning=reasoning)
 
     async def _forecast_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction:
         premortem = await self._run_premortem_analysis(question, research)
@@ -274,28 +278,25 @@ class HybridPreMortemBot(ForecastBot):
             median_val = float(np.median(values))
             aggregated_percentiles.append(Percentile(percentile=p / 100.0, value=median_val))
         
-        # ✅ Infer bounds from question type
+        # ✅ Infer bounds from question semantics
         question_text = question.question_text.lower()
         if "yield" in question_text or "spread" in question_text:
-            # UST Yield or HY Spread: cannot be < 0%
             open_lower_bound = False
-            lower_bound = 0.0
+            lower_bound: Optional[float] = 0.0
             open_upper_bound = True
-            upper_bound = None
+            upper_bound: Optional[float] = None
         elif "exceed" in question_text and ("return" in question_text or "stock" in question_text):
-            # Relative returns: unbounded
             open_lower_bound = True
             open_upper_bound = True
             lower_bound = None
             upper_bound = None
         else:
-            # Default: unbounded
             open_lower_bound = True
             open_upper_bound = True
             lower_bound = None
             upper_bound = None
 
-        # ✅ Construct with ALL required fields
+        # ✅ CORRECT CONSTRUCTION: ALL 5 FIELDS, CORRECT NAMES
         distribution = NumericDistribution(
             declared_percentiles=aggregated_percentiles,
             open_lower_bound=open_lower_bound,
@@ -307,7 +308,7 @@ class HybridPreMortemBot(ForecastBot):
         return ReasonedPrediction(forecast=distribution, reasoning=reasoning)
 
     # -----------------------------
-    # Required Abstract Methods
+    # Abstract method implementations
     # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction:
         return await self._forecast_binary(question, research)
