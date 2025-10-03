@@ -61,7 +61,7 @@ class HybridPreMortemBot(ForecastBot):
             "pre_mortem_agent": "openrouter/anthropic/claude-3-opus-20240229",
             "pre_parade_agent": "openrouter/qwen/qwen-2-72b-instruct",
             "advocate_agent": "openrouter/mistralai/mistral-large-latest",
-            "risk_synthesizer": "openrouter/openai/o3-mini",
+            "risk_synthesizer": "openrouter/openai/gpt-5",
             "synthesizer_1": "openrouter/openai/o3",
             "synthesizer_2": "openrouter/openai/o4-mini",
             "synthesizer_3": "openrouter/anthropic/claude-3-opus-20240229",
