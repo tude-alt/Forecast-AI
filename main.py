@@ -210,11 +210,11 @@ class HybridPreMortemBot(ForecastBot):
         You are a superforecaster. Provide 10th, 50th (median), and 90th percentiles for the numeric outcome.
 
         Question: {question.question_text}
-        Units or context: {unit_info}
-        Briefing: {research}
+        Expected unit/format: {unit_info}
+        Research briefing: {research}
 
         Respond ONLY with a JSON object like:
-        {{"percentiles": [{{"percentile": 10, "value": 5.2}}, {{"percentile": 50, "value": 12.0}}, {{"percentile": 90, "value": 25.5}}], "reasoning": "..."}}
+        {{"percentiles": [{{"percentile": 10, "value": -2.1}}, {{"percentile": 50, "value": 1.5}}, {{"percentile": 90, "value": 5.8}}], "reasoning": "..."}}
         """)
         llm = self.get_llm(synthesizer_key, "llm")
         response = await llm.invoke(prompt)
@@ -225,15 +225,25 @@ class HybridPreMortemBot(ForecastBot):
                 percentiles.append({"percentile": int(p["percentile"]), "value": float(p["value"])})
             return {"percentiles": percentiles, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
-            logger.warning(f"Synthesizer {synthesizer_key} numeric parsing failed: {e}. Using default.")
-            return {
-                "percentiles": [
-                    {"percentile": 10, "value": 0.1},
-                    {"percentile": 50, "value": 0.5},
-                    {"percentile": 90, "value": 0.9}
-                ],
-                "reasoning": "Fallback due to parsing or attribute error."
-            }
+            logger.warning(f"Synthesizer {synthesizer_key} numeric parsing failed: {e}. Using symmetric default.")
+            if "exceed" in question.question_text.lower():
+                return {
+                    "percentiles": [
+                        {"percentile": 10, "value": -5.0},
+                        {"percentile": 50, "value": 0.0},
+                        {"percentile": 90, "value": 5.0}
+                    ],
+                    "reasoning": "Fallback for relative return question."
+                }
+            else:
+                return {
+                    "percentiles": [
+                        {"percentile": 10, "value": 0.1},
+                        {"percentile": 50, "value": 0.5},
+                        {"percentile": 90, "value": 0.9}
+                    ],
+                    "reasoning": "Generic fallback."
+                }
 
     # -----------------------------
     # Median-Aggregated Forecast Pipelines
@@ -274,7 +284,7 @@ class HybridPreMortemBot(ForecastBot):
             self._single_numeric_forecast(key, question, research)
             for key in self.synthesizer_keys
         ])
-        target_percentiles = [10, 50, 90]
+        target_percentiles = [10, 50, 90]  # LLM uses 10/50/90 (human-readable)
         aggregated = []
         for p in target_percentiles:
             values = []
@@ -286,7 +296,8 @@ class HybridPreMortemBot(ForecastBot):
                 else:
                     values.append(0.0)
             median_val = float(np.median(values))
-            aggregated.append(Percentile(percentile=p, value=median_val))
+            # 🔥 CRITICAL FIX: Convert 10 → 0.10, 50 → 0.50, 90 → 0.90
+            aggregated.append(Percentile(percentile=p / 100.0, value=median_val))
         distribution = NumericDistribution(aggregated)
         combined_reasoning = " | ".join([f["reasoning"] for f in forecasts])
         return ReasonedPrediction(forecast=distribution, reasoning=combined_reasoning)
@@ -319,7 +330,7 @@ if __name__ == "__main__":
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # llms dict is optional now since _llm_config_defaults covers all
+        # llms dict is optional since _llm_config_defaults covers all
     )
 
     try:
@@ -334,11 +345,16 @@ if __name__ == "__main__":
             forecast_reports = all_reports
         elif run_mode == "test_questions":
             logger.info("Running in test questions mode...")
-            # FIXED: no trailing space in URL
+            # FIXED: No trailing spaces; includes extinction + Q4 2025 questions
             EXAMPLE_QUESTIONS = [
                 "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
                 "https://www.metaculus.com/questions/40046/",
                 "https://www.metaculus.com/questions/40045/",
+                "https://www.metaculus.com/questions/40044/",
+                "https://www.metaculus.com/questions/40043/",
+                "https://www.metaculus.com/questions/40042/",
+                "https://www.metaculus.com/questions/40041/",
+                "https://www.metaculus.com/questions/40040/",
                 "https://www.metaculus.com/questions/40038/",
             ]
             questions = [MetaculusApi.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTIONS]
