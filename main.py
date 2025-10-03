@@ -63,12 +63,9 @@ class HybridPreMortemBot(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def _llm_config_defaults(self) -> dict[str, str]:
-        """Provide defaults for all LLM roles used internally or expected by base class."""
         return {
-            # Base class expected roles (to suppress warnings)
             "summarizer": "openrouter/openai/gpt-4o-mini",
             "researcher": "openrouter/openai/gpt-4o-search-preview",
-            # Custom pipeline roles
             "online_researcher": "openrouter/perplexity/llama-3-sonar-large-32k-online",
             "research_synthesizer": "openrouter/openai/gpt-4o",
             "pre_mortem_agent": "openrouter/openai/gpt-5",
@@ -85,13 +82,40 @@ class HybridPreMortemBot(ForecastBot):
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.serpapi_key = SERPAPI_API_KEY
-        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
-        if not self.synthesizer_keys:
-            raise ValueError("No synthesizer models found in LLM configuration.")
-        logger.info(f"Initialized with Hybrid analysis pipeline and a committee of {len(self.synthesizer_keys)} synthesizers.")
+        logger.info("Initialized HybridPreMortemBot with domain-aware routing.")
+
+    def _get_synth_models_for_question(self, question: MetaculusQuestion) -> List[str]:
+        """Route to specialized models based on question domain."""
+        text = question.question_text.lower()
+        if "extinction" in text or "population" in text or "x-risk" in text:
+            return ["synthesizer_2", "synthesizer_1"]  # GPT-5, O3
+        elif any(kw in text for kw in ["yield", "spread", "stock", "nvidia", "apple", "nasdaq", "s&p", "futures", "oil"]):
+            return ["synthesizer_3", "synthesizer_2"]  # Claude Sonnet 4, GPT-5
+        else:
+            return ["synthesizer_1", "synthesizer_2", "synthesizer_3"]
+
+    async def _run_premortem_analysis(self, question: MetaculusQuestion, research: str) -> str:
+        prompt = clean_indents(f"""
+        Imagine the correct answer to the following question is the opposite of what you expect.
+        List 3 plausible, evidence-based reasons why your forecast could be wrong.
+
+        Question: {question.question_text}
+        Research: {research[:1000]}...
+        """)
+        return await self.get_llm("pre_mortem_agent", "llm").invoke(prompt)
+
+    async def _run_preparade_analysis(self, question: MetaculusQuestion, research: str) -> str:
+        prompt = clean_indents(f"""
+        Imagine the outcome is far more extreme than expected (e.g., very high or very low).
+        What tail risks, black swans, or catalysts could cause this?
+        
+        Question: {question.question_text}
+        Research: {research[:1000]}...
+        """)
+        return await self.get_llm("pre_parade_agent", "llm").invoke(prompt)
 
     # -----------------------------
-    # External Research Methods
+    # External Research Methods (same as before)
     # -----------------------------
     def call_tavily(self, query: str) -> str:
         if not self.tavily_client.api_key: return "Tavily search not performed."
@@ -110,7 +134,7 @@ class HybridPreMortemBot(ForecastBot):
 
     def call_serpapi(self, query: str) -> str:
         if not self.serpapi_key: return "SerpApi search not performed."
-        url = "https://serpapi.com/search.json"  # Fixed: no trailing space
+        url = "https://serpapi.com/search.json"
         params = {"q": query, "api_key": self.serpapi_key}
         try:
             response = requests.get(url, params=params)
@@ -136,8 +160,7 @@ class HybridPreMortemBot(ForecastBot):
             for i, result in enumerate(results):
                 raw_research_dump += f"--- RAW DATA FROM: {source_names[i].upper()} ---\n{result}\n\n"
             synthesis_prompt = clean_indents(f"""
-            You are a senior intelligence analyst. Your job is to synthesize raw, potentially redundant 
-            data from multiple sources into a single, clean, and comprehensive briefing for a team of superforecasters.  
+            You are a senior intelligence analyst. Synthesize this into a clean briefing.
 
             Raw Data Dump:
             {raw_research_dump}
@@ -145,46 +168,41 @@ class HybridPreMortemBot(ForecastBot):
             Synthesized Intelligence Briefing:
             """)
             final_briefing = await self.get_llm("research_synthesizer", "llm").invoke(synthesis_prompt)
-            logger.info(f"--- All-Source Research Complete for Q {question.page_url} ---")
             return final_briefing
 
     # -----------------------------
-    # Single Synthesizer Forecasters
+    # Single Synthesizer Forecasters (same logic, now used for all types)
     # -----------------------------
-    async def _single_binary_forecast(self, synthesizer_key: str, question: BinaryQuestion, research: str) -> Dict[str, Any]:
+    async def _single_binary_forecast(self, synthesizer_key: str, question: BinaryQuestion, context: str) -> Dict[str, Any]:
         prompt = clean_indents(f"""
-        You are a superforecaster. Based on the intelligence briefing below, estimate the probability (between 0.0 and 1.0) 
-        that the following event will occur.
+        You are a superforecaster. Estimate probability (0.0–1.0) that the event occurs.
 
         Question: {question.question_text}
-        Briefing: {research}
+        Context: {context}
 
-        Respond ONLY with a JSON object in this exact format:
-        {{"probability": 0.75, "reasoning": "Concise justification..."}}
+        Respond ONLY with JSON: {{"probability": 0.75, "reasoning": "..."}}
         """)
         llm = self.get_llm(synthesizer_key, "llm")
         response = await llm.invoke(prompt)
         try:
             parsed = json.loads(response.strip())
-            prob = float(parsed["probability"])
-            prob = max(0.0, min(1.0, prob))
+            prob = max(0.0, min(1.0, float(parsed["probability"])))
             return {"probability": prob, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
-            logger.warning(f"Synthesizer {synthesizer_key} returned invalid JSON: {e}. Using 0.5 as fallback.")
-            return {"probability": 0.5, "reasoning": "Fallback due to parsing error."}
+            logger.warning(f"Binary parsing failed: {e}. Fallback to 0.5.")
+            return {"probability": 0.5, "reasoning": "Fallback"}
 
-    async def _single_mc_forecast(self, synthesizer_key: str, question: MultipleChoiceQuestion, research: str) -> Dict[str, Any]:
+    async def _single_mc_forecast(self, synthesizer_key: str, question: MultipleChoiceQuestion, context: str) -> Dict[str, Any]:
         options_str = "\n".join([f"- {opt}" for opt in question.options])
         prompt = clean_indents(f"""
-        You are a superforecaster. Assign probabilities to each option below so they sum to 1.0.
+        Assign probabilities to each option (must sum to 1.0).
 
         Question: {question.question_text}
         Options:
         {options_str}
-        Briefing: {research}
+        Context: {context}
 
-        Respond ONLY with a JSON object like:
-        {{"probabilities": [0.2, 0.5, 0.3], "reasoning": "..."}}
+        Respond ONLY with JSON: {{"probabilities": [0.2, 0.5, 0.3], "reasoning": "..."}}
         """)
         llm = self.get_llm(synthesizer_key, "llm")
         response = await llm.invoke(prompt)
@@ -198,23 +216,20 @@ class HybridPreMortemBot(ForecastBot):
                 probs = [p / total for p in probs]
             return {"probabilities": probs, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
-            logger.warning(f"Synthesizer {synthesizer_key} MC parsing failed: {e}. Uniform fallback.")
+            logger.warning(f"MC parsing failed: {e}. Uniform fallback.")
             uniform = [1.0 / len(question.options)] * len(question.options)
-            return {"probabilities": uniform, "reasoning": "Fallback due to parsing error."}
+            return {"probabilities": uniform, "reasoning": "Fallback"}
 
-    async def _single_numeric_forecast(self, synthesizer_key: str, question: NumericQuestion, research: str) -> Dict[str, Any]:
-        # Safely get unit info; fallback if not available
+    async def _single_numeric_forecast(self, synthesizer_key: str, question: NumericQuestion, context: str) -> Dict[str, Any]:
         unit_info = getattr(question, 'unit', getattr(question, 'units', 'Not specified'))
-
         prompt = clean_indents(f"""
-        You are a superforecaster. Provide 10th, 50th (median), and 90th percentiles for the numeric outcome.
+        Provide 10th, 50th, 90th percentiles.
 
         Question: {question.question_text}
-        Expected unit/format: {unit_info}
-        Research briefing: {research}
+        Unit/format: {unit_info}
+        Context: {context}
 
-        Respond ONLY with a JSON object like:
-        {{"percentiles": [{{"percentile": 10, "value": -2.1}}, {{"percentile": 50, "value": 1.5}}, {{"percentile": 90, "value": 5.8}}], "reasoning": "..."}}
+        Respond ONLY with JSON: {{"percentiles": [{{"percentile": 10, "value": -2.1}}, ...], "reasoning": "..."}}
         """)
         llm = self.get_llm(synthesizer_key, "llm")
         response = await llm.invoke(prompt)
@@ -225,33 +240,24 @@ class HybridPreMortemBot(ForecastBot):
                 percentiles.append({"percentile": int(p["percentile"]), "value": float(p["value"])})
             return {"percentiles": percentiles, "reasoning": parsed.get("reasoning", "")}
         except Exception as e:
-            logger.warning(f"Synthesizer {synthesizer_key} numeric parsing failed: {e}. Using symmetric default.")
+            logger.warning(f"Numeric parsing failed: {e}. Fallback.")
             if "exceed" in question.question_text.lower():
-                return {
-                    "percentiles": [
-                        {"percentile": 10, "value": -5.0},
-                        {"percentile": 50, "value": 0.0},
-                        {"percentile": 90, "value": 5.0}
-                    ],
-                    "reasoning": "Fallback for relative return question."
-                }
+                return {"percentiles": [{"percentile":10,"value":-5},{"percentile":50,"value":0},{"percentile":90,"value":5}], "reasoning": "Fallback"}
             else:
-                return {
-                    "percentiles": [
-                        {"percentile": 10, "value": 0.1},
-                        {"percentile": 50, "value": 0.5},
-                        {"percentile": 90, "value": 0.9}
-                    ],
-                    "reasoning": "Generic fallback."
-                }
+                return {"percentiles": [{"percentile":10,"value":0.1},{"percentile":50,"value":0.5},{"percentile":90,"value":0.9}], "reasoning": "Fallback"}
 
     # -----------------------------
-    # Median-Aggregated Forecast Pipelines
+    # Forecast Pipelines with Pre-Mortem + Domain Routing
     # -----------------------------
     async def _forecast_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction:
+        premortem = await self._run_premortem_analysis(question, research)
+        preparade = await self._run_preparade_analysis(question, research)
+        context = f"RESEARCH:\n{research}\n\nPRE-MORTEM (why wrong?):\n{premortem}\n\nPRE-PARADE (extreme outcomes?):\n{preparade}"
+        
+        synthesizers = self._get_synth_models_for_question(question)
         forecasts = await asyncio.gather(*[
-            self._single_binary_forecast(key, question, research)
-            for key in self.synthesizer_keys
+            self._single_binary_forecast(key, question, context)
+            for key in synthesizers
         ])
         probabilities = [f["probability"] for f in forecasts]
         median_prob = float(np.median(probabilities))
@@ -260,31 +266,35 @@ class HybridPreMortemBot(ForecastBot):
         return ReasonedPrediction(forecast=forecast, reasoning=combined_reasoning)
 
     async def _forecast_mc(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction:
+        premortem = await self._run_premortem_analysis(question, research)
+        context = f"RESEARCH:\n{research}\n\nPRE-MORTEM:\n{premortem}"
+        
+        synthesizers = self._get_synth_models_for_question(question)
         forecasts = await asyncio.gather(*[
-            self._single_mc_forecast(key, question, research)
-            for key in self.synthesizer_keys
+            self._single_mc_forecast(key, question, context)
+            for key in synthesizers
         ])
         all_probs = np.array([f["probabilities"] for f in forecasts])
         median_probs = np.median(all_probs, axis=0)
-        total = median_probs.sum()
-        if total > 0:
-            median_probs = median_probs / total
+        if median_probs.sum() > 0:
+            median_probs = median_probs / median_probs.sum()
         else:
             median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
-        forecast_list = [
-            {"option": opt, "probability": float(p)}
-            for opt, p in zip(question.options, median_probs)
-        ]
+        forecast_list = [{"option": opt, "probability": float(p)} for opt, p in zip(question.options, median_probs)]
         forecast = PredictedOptionList(forecast_list)
         combined_reasoning = " | ".join([f["reasoning"] for f in forecasts])
         return ReasonedPrediction(forecast=forecast, reasoning=combined_reasoning)
 
     async def _forecast_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction:
+        premortem = await self._run_premortem_analysis(question, research)
+        context = f"RESEARCH:\n{research}\n\nPRE-MORTEM:\n{premortem}"
+        
+        synthesizers = self._get_synth_models_for_question(question)
         forecasts = await asyncio.gather(*[
-            self._single_numeric_forecast(key, question, research)
-            for key in self.synthesizer_keys
+            self._single_numeric_forecast(key, question, context)
+            for key in synthesizers
         ])
-        target_percentiles = [10, 50, 90]  # LLM uses 10/50/90 (human-readable)
+        target_percentiles = [10, 50, 90]
         aggregated = []
         for p in target_percentiles:
             values = []
@@ -296,9 +306,9 @@ class HybridPreMortemBot(ForecastBot):
                 else:
                     values.append(0.0)
             median_val = float(np.median(values))
-            # 🔥 CRITICAL FIX: Convert 10 → 0.10, 50 → 0.50, 90 → 0.90
             aggregated.append(Percentile(percentile=p / 100.0, value=median_val))
-        distribution = NumericDistribution(aggregated)
+        # 🔥 CRITICAL FIX: Use keyword argument
+        distribution = NumericDistribution(percentiles=aggregated)
         combined_reasoning = " | ".join([f["reasoning"] for f in forecasts])
         return ReasonedPrediction(forecast=distribution, reasoning=combined_reasoning)
 
@@ -330,7 +340,6 @@ if __name__ == "__main__":
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # llms dict is optional since _llm_config_defaults covers all
     )
 
     try:
@@ -345,7 +354,6 @@ if __name__ == "__main__":
             forecast_reports = all_reports
         elif run_mode == "test_questions":
             logger.info("Running in test questions mode...")
-            # FIXED: No trailing spaces; includes extinction + Q4 2025 questions
             EXAMPLE_QUESTIONS = [
                 "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
                 "https://www.metaculus.com/questions/40046/",
