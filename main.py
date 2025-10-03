@@ -58,13 +58,13 @@ class HybridPreMortemBot(ForecastBot):
         defaults.update({
             "online_researcher": "openrouter/perplexity/llama-3-sonar-large-32k-online",
             "research_synthesizer": "openrouter/openai/gpt-4o",
-            "pre_mortem_agent": "openrouter/anthropic/claude-3-opus-20240229",
-            "pre_parade_agent": "openrouter/qwen/qwen-2-72b-instruct",
-            "advocate_agent": "openrouter/mistralai/mistral-large-latest",
+            "pre_mortem_agent": "openrouter/openai/gpt-5",
+            "pre_parade_agent": "openrouter/openai/gpt-4.1",
+            "advocate_agent": "openrouter/openai/gpt-4.1-nano",
             "risk_synthesizer": "openrouter/openai/gpt-5",
             "synthesizer_1": "openrouter/openai/o3",
-            "synthesizer_2": "openrouter/openai/o4-mini",
-            "synthesizer_3": "openrouter/anthropic/claude-3-opus-20240229",
+            "synthesizer_2": "openrouter/openai/gpt-5",
+            "synthesizer_3": "openrouter/anthropic/claude-sonnet-4",
         })
         return defaults
 
@@ -258,13 +258,13 @@ if __name__ == "__main__":
             "parser": GeneralLlm(model="openrouter/openai/gpt-4o"),
             "online_researcher": GeneralLlm(model="openrouter/perplexity/llama-3-sonar-large-32k-online"),
             "research_synthesizer": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
-            "pre_mortem_agent": GeneralLlm(model="openrouter/anthropic/claude-3-opus-20240229", temperature=0.5),
-            "pre_parade_agent": GeneralLlm(model="openrouter/qwen/qwen-2-72b-instruct", temperature=0.5),
-            "advocate_agent": GeneralLlm(model="openrouter/mistralai/mistral-large-latest", temperature=0.4),
-            "risk_synthesizer": GeneralLlm(model="openrouter/openai/o3-mini", temperature=0.1),
+            "pre_mortem_agent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.5),
+            "pre_parade_agent": GeneralLlm(model="openrouter/openai/gpt-4.1", temperature=0.5),
+            "advocate_agent": GeneralLlm(model="openrouter/openai/gpt-4.1-nano", temperature=0.4),
+            "risk_synthesizer": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.1),
             "synthesizer_1": GeneralLlm(model="openrouter/openai/o3", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openrouter/openai/o4-mini", temperature=0.2),
-            "synthesizer_3": GeneralLlm(model="openrouter/anthropic/claude-3-opus-20240229", temperature=0.2),
+            "synthesizer_2": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.2),
+            "synthesizer_3": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4", temperature=0.2),
         },
     )
     try:
