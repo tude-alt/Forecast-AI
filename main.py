@@ -263,7 +263,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32813", "market-pulse-25q4", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "ACX2026", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
