@@ -191,7 +191,7 @@ class ConservativeHybridBot(ForecastBot):
         reasonings = []
         models = [
             "openrouter/openai/gpt-5",
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4"
         ]
         for model in models:
@@ -206,7 +206,7 @@ class ConservativeHybridBot(ForecastBot):
         reasonings = []
         models = [
             "openrouter/openai/gpt-5",
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4"
         ]
         for model in models:
@@ -230,7 +230,7 @@ class ConservativeHybridBot(ForecastBot):
         reasonings = []
         models = [
             "openrouter/openai/gpt-5",
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4"
         ]
         for model in models:
@@ -263,7 +263,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "climate", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "metaculus-cup-spring-2026", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
