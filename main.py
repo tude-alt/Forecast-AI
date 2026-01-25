@@ -1,7 +1,5 @@
 # main.py
-# Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
-# Fully fixed: no missing imports, no .id access, robust forecasting
-
+# Conservative Hybrid Forecasting Bot 
 import argparse
 import asyncio
 import json
@@ -445,7 +443,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "market-pulse-26q1", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
