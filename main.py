@@ -1,5 +1,7 @@
 # main.py
-# Conservative Hybrid Forecasting Bot 
+# Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
+# Now with Confident-Conservative mode for high-scoring binary forecasts
+
 import argparse
 import asyncio
 import json
@@ -60,10 +62,10 @@ def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
     """Safely extract community prediction; return None if unavailable."""
     try:
         pred = getattr(question, 'community_prediction', None)
-        if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
+        if pred is not None and isinstance(pred, (int, float)):
             return float(pred)
         pred = getattr(question, 'prediction', None)
-        if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
+        if pred is not None and isinstance(pred, (int, float)):
             return float(pred)
     except Exception as e:
         logger.warning(f"Failed to get community prediction for Q{extract_question_id(question)}: {e}")
@@ -84,7 +86,7 @@ def interpolate_missing_percentiles(
 ) -> list[Percentile]:
     """Interpolate missing percentiles using linear interpolation on available ones."""
     if not reported:
-        return [Percentile(p, 0.0) for p in target_percentiles]
+        return [Percentile(percentile=p, value=0.0) for p in target_percentiles]
 
     sorted_rep = sorted(reported, key=lambda x: x.percentile)
     xs = [p.percentile for p in sorted_rep]
@@ -163,12 +165,10 @@ def log_forecast_for_calibration(
 
 class ConservativeHybridBot(ForecastBot):
     """
-    Conservative forecasting bot using:
-    - Research: Tavily + NewsAPI + Perplexity (OpenRouter)
-    - Models: gpt-5, gpt-4.1-mini, claude-sonnet-4 (OpenRouter)
-    - Aggregation: Median across 3 forecasts
-    - Compliance: structure_output + NumericDistribution.from_question()
-    - Enhanced with base rates, robust aggregation, and calibration logging
+    Conservative forecasting bot with Confident-Conservative mode:
+    - Uses base rates, research, and ensemble median
+    - For binary: goes extreme (>95% or <5%) ONLY when strong evidence exists
+    - Otherwise stays moderate to avoid log-score penalties
     """
 
     _max_concurrent_questions = 3
@@ -230,7 +230,13 @@ class ConservativeHybridBot(ForecastBot):
             self._llms["parser"] = GeneralLlm(model="openrouter/openai/gpt-4.1-mini")
 
         base_rate = safe_community_prediction(question)
-        base_rate_str = f"Community prediction (base rate): {base_rate:.1%}" if base_rate is not None else "No reliable base rate available."
+        if base_rate is not None:
+            if isinstance(question, BinaryQuestion):
+                base_rate_str = f"Community prediction (base rate): {base_rate:.1%}"
+            else:
+                base_rate_str = f"Community prediction (base rate): {base_rate:,.2f}"
+        else:
+            base_rate_str = "No reliable base rate available."
 
         research_sufficient = is_research_sufficient(research)
         if not research_sufficient:
@@ -300,8 +306,8 @@ class ConservativeHybridBot(ForecastBot):
             Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
-            Consider status quo, trends, expert views, and black swans.
-            If research is weak, widen your intervals significantly.
+            IMPORTANT: The answer must be in the correct scale (e.g., if forecasting NVIDIA revenue in USD, expect values in BILLIONS, not millions or percentages).
+            If the community prediction is available, it is given in the correct units—use it as an anchor.
 
             Provide percentiles: 10, 20, 40, 60, 80, 90.
             """)
@@ -327,11 +333,62 @@ class ConservativeHybridBot(ForecastBot):
         ]
         forecasts = []
         reasonings = []
+
         for model in models:
             try:
                 pred, reason = await self._single_forecast(question, research, model_override=model)
-                forecasts.append(pred)
-                reasonings.append(reason)
+                
+                # --- CONFIDENT-CONSERVATIVE ADJUSTMENT ---
+                base_rate = safe_community_prediction(question) or 0.5
+                research_sufficient = is_research_sufficient(research)
+                should_be_extreme = False
+                direction = None
+
+                if research_sufficient:
+                    extremity_prompt = clean_indents(f"""
+                    You are a superforecaster evaluating evidence strength.
+
+                    Question: {question.question_text}
+                    Background: {question.background_info}
+                    Resolution criteria: {question.resolution_criteria}
+                    Current forecast (pre-adjustment): {pred:.1%}
+                    Community prediction: {base_rate:.1%}
+                    Research: {research}
+                    Today: {datetime.now().strftime("%Y-%m-%d")}
+
+                    Is there STRONG, UNAMBIGUOUS evidence that the outcome will be YES or NO?
+                    - "Strong" = multiple credible sources, official announcements, irreversible trends
+                    - "Unambiguous" = no plausible counter-scenarios
+
+                    Answer ONLY: "YES", "NO", or "UNCERTAIN"
+                    """)
+                    try:
+                        extremity_llm = self.get_llm("parser", "llm")
+                        extremity_response = await extremity_llm.invoke(extremity_prompt)
+                        extremity_response = extremity_response.strip().upper()
+                        if extremity_response == "YES":
+                            should_be_extreme = True
+                            direction = "yes"
+                        elif extremity_response == "NO":
+                            should_be_extreme = True
+                            direction = "no"
+                    except Exception as e:
+                        logger.debug(f"Extremity check failed for Q{extract_question_id(question)}: {e}")
+                
+                # Apply adjustment
+                final_pred = pred
+                if should_be_extreme:
+                    if direction == "yes":
+                        final_pred = max(pred, 0.95)
+                    else:  # "no"
+                        final_pred = min(pred, 0.05)
+                    adjusted_reason = f"[EXTREME ADJUSTMENT: {direction.upper()}] " + reason
+                else:
+                    adjusted_reason = "[MODERATE] " + reason
+                
+                forecasts.append(max(0.01, min(0.99, final_pred)))
+                reasonings.append(adjusted_reason)
+
             except Exception as e:
                 logger.warning(f"Model {model} failed on binary Q{extract_question_id(question)}: {e}")
                 base = safe_community_prediction(question) or 0.5
@@ -395,20 +452,29 @@ class ConservativeHybridBot(ForecastBot):
             except Exception as e:
                 logger.warning(f"Model {model} failed on numeric Q{extract_question_id(question)}: {e}")
                 base = safe_community_prediction(question)
+                lower_b = question.lower_bound or 0
+                upper_b = question.upper_bound or 1
                 if base is not None:
-                    width = (question.upper_bound - question.lower_bound) * 0.3
-                    center = base * (question.upper_bound - question.lower_bound) + question.lower_bound
-                    fallback_vals = [center - width, center - width*0.5, center, center, center + width*0.5, center + width]
+                    center = float(base)
+                    width = (upper_b - lower_b) * 0.2
                 else:
-                    fallback_vals = [
-                        question.lower_bound or 0,
-                        question.lower_bound or 0,
-                        (question.lower_bound + question.upper_bound)/2,
-                        (question.lower_bound + question.upper_bound)/2,
-                        question.upper_bound or 1,
-                        question.upper_bound or 1
-                    ]
-                fallback_ps = [Percentile(p, v) for p, v in zip([0.1,0.2,0.4,0.6,0.8,0.9], fallback_vals)]
+                    center = (lower_b + upper_b) / 2
+                    width = (upper_b - lower_b) * 0.3
+
+                fallback_vals = [
+                    center - width * 0.8,
+                    center - width * 0.4,
+                    center - width * 0.1,
+                    center + width * 0.1,
+                    center + width * 0.4,
+                    center + width * 0.8,
+                ]
+                fallback_vals = [max(lower_b, min(upper_b, v)) for v in fallback_vals]
+                
+                fallback_ps = [
+                    Percentile(percentile=p, value=v)
+                    for p, v in zip([0.1, 0.2, 0.4, 0.6, 0.8, 0.9], fallback_vals)
+                ]
                 fallback_dist = NumericDistribution.from_question(fallback_ps, question)
                 forecasts.append(fallback_dist)
                 reasonings.append(f"FALLBACK due to error: {e}")
@@ -443,7 +509,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "market-pulse-26q1", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
