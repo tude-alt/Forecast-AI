@@ -1,12 +1,14 @@
 # main.py
 # Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
+# Enhanced with forecasting best practices (base rates, robust aggregation, calibration logging, etc.)
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Optional, Any
 
 import numpy as np
 import requests
@@ -46,6 +48,118 @@ logging.basicConfig(
 logger = logging.getLogger("ConservativeHybridBot")
 
 
+def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
+    """Safely extract community prediction; return None if unavailable."""
+    try:
+        # Adjust based on actual API: could be .community_prediction, .prediction, etc.
+        pred = getattr(question, 'community_prediction', None)
+        if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
+            return float(pred)
+        # Fallback: some APIs use 'prediction' or 'latest_community_prediction'
+        pred = getattr(question, 'prediction', None)
+        if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
+            return float(pred)
+    except Exception as e:
+        logger.warning(f"Failed to get community prediction for Q{question.id}: {e}")
+    return None
+
+
+def is_research_sufficient(research: str) -> bool:
+    """Heuristic: research is sufficient if it contains non-error content from at least one source."""
+    if not research or "failed" in research.lower():
+        return False
+    # Require at least 50 chars of real content
+    cleaned = research.replace("--- SOURCE", "").replace("Tavily failed", "").replace("NewsAPI failed", "")
+    return len(cleaned.strip()) > 50
+
+
+def interpolate_missing_percentiles(
+    reported: list[Percentile],
+    target_percentiles: list[float]
+) -> list[Percentile]:
+    """Interpolate missing percentiles using linear interpolation on available ones."""
+    if not reported:
+        return [Percentile(p, 0.0) for p in target_percentiles]
+
+    # Sort by percentile
+    sorted_rep = sorted(reported, key=lambda x: x.percentile)
+    xs = [p.percentile for p in sorted_rep]
+    ys = [p.value for p in sorted_rep]
+
+    interpolated = []
+    for tp in target_percentiles:
+        if tp in xs:
+            val = ys[xs.index(tp)]
+        else:
+            # Linear interpolation
+            from bisect import bisect_left
+            i = bisect_left(xs, tp)
+            if i == 0:
+                val = ys[0]
+            elif i == len(xs):
+                val = ys[-1]
+            else:
+                x0, x1 = xs[i-1], xs[i]
+                y0, y1 = ys[i-1], ys[i]
+                val = y0 + (y1 - y0) * (tp - x0) / (x1 - x0) if x1 != x0 else y0
+        interpolated.append(Percentile(percentile=tp, value=val))
+    return interpolated
+
+
+def enforce_numeric_constraints(
+    percentiles: list[Percentile],
+    question: NumericQuestion
+) -> list[Percentile]:
+    """Enforce bounds and monotonicity."""
+    lower = question.lower_bound if not question.open_lower_bound else -np.inf
+    upper = question.upper_bound if not question.open_upper_bound else np.inf
+
+    # Apply bounds
+    bounded = []
+    for p in percentiles:
+        val = max(lower, min(upper, p.value))
+        bounded.append(Percentile(percentile=p.percentile, value=val))
+
+    # Enforce monotonicity (non-decreasing)
+    sorted_by_p = sorted(bounded, key=lambda x: x.percentile)
+    values = [p.value for p in sorted_by_p]
+    for i in range(1, len(values)):
+        if values[i] < values[i-1]:
+            values[i] = values[i-1]
+
+    return [Percentile(percentile=sorted_by_p[i].percentile, value=values[i]) for i in range(len(values))]
+
+
+# Calibration logging helper
+CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
+
+def log_forecast_for_calibration(
+    question: MetaculusQuestion,
+    prediction_value: Any,
+    reasoning: str,
+    model_ids: list[str],
+    research_used: bool
+):
+    """Log forecast details for post-resolution scoring."""
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "question_id": question.id,
+        "question_type": question.__class__.__name__,
+        "question_text": question.question_text,
+        "resolution_date": getattr(question, 'resolution_date', None),
+        "community_prediction": safe_community_prediction(question),
+        "prediction_value": prediction_value,
+        "models_used": model_ids,
+        "research_used": research_used,
+        "reasoning_snippet": reasoning[:500]  # truncate
+    }
+    try:
+        with open(CALIBRATION_LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to log calibration data: {e}")
+
+
 class ConservativeHybridBot(ForecastBot):
     """
     Conservative forecasting bot using:
@@ -53,9 +167,11 @@ class ConservativeHybridBot(ForecastBot):
     - Models: gpt-5, gpt-4.1-mini, claude-sonnet-4 (OpenRouter)
     - Aggregation: Median across 3 forecasts
     - Compliance: structure_output + NumericDistribution.from_question()
+    - Enhanced with base rates, robust aggregation, and calibration logging
     """
 
-    _max_concurrent_questions = 1
+    # Slightly increased concurrency; adjust based on API limits
+    _max_concurrent_questions = 3
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def _llm_config_defaults(self) -> dict[str, str]:
@@ -100,7 +216,9 @@ class ConservativeHybridBot(ForecastBot):
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             raw_research = ""
             for i, result in enumerate(results):
-                raw_research += f"--- SOURCE {list(tasks.keys())[i].upper()} ---\n{result}\n\n"
+                src = list(tasks.keys())[i]
+                content = str(result) if not isinstance(result, Exception) else f"{src} error: {result}"
+                raw_research += f"--- SOURCE {src.upper()} ---\n{content}\n\n"
             return raw_research
 
     # -----------------------------
@@ -111,6 +229,13 @@ class ConservativeHybridBot(ForecastBot):
             self._llms["default"] = GeneralLlm(model=model_override)
             self._llms["parser"] = GeneralLlm(model="openrouter/openai/gpt-4.1-mini")
 
+        base_rate = safe_community_prediction(question)
+        base_rate_str = f"Community prediction (base rate): {base_rate:.1%}" if base_rate is not None else "No reliable base rate available."
+
+        research_sufficient = is_research_sufficient(research)
+        if not research_sufficient:
+            research = "(Insufficient recent research available. Relying on base rates and general knowledge.)\n" + research
+
         if isinstance(question, BinaryQuestion):
             prompt = clean_indents(f"""
             You are a professional forecaster known for conservative, well-calibrated predictions.
@@ -119,15 +244,16 @@ class ConservativeHybridBot(ForecastBot):
             Background: {question.background_info}
             Resolution criteria: {question.resolution_criteria}
             Fine print: {question.fine_print}
+            {base_rate_str}
             Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
             Consider:
             (a) Time until resolution
             (b) Status quo (world changes slowly)
-            (c) Base rates and community estimates (e.g., 30% for major population drops)
+            (c) Base rates — anchor to them unless strong evidence overrides
 
-            Be humble. Avoid overconfidence.
+            Be humble. Avoid overconfidence. If research is weak, defer to base rate.
 
             End with: "Probability: ZZ%"
             """)
@@ -143,10 +269,12 @@ class ConservativeHybridBot(ForecastBot):
             Options: {question.options}
             Background: {question.background_info}
             Resolution: {question.resolution_criteria}
+            {base_rate_str}
             Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
             Assign probabilities. Do not assign 0% to any option unless logically impossible.
+            If uncertain, distribute probability evenly or according to base rates.
 
             End with probabilities for each option in order.
             """)
@@ -168,16 +296,23 @@ class ConservativeHybridBot(ForecastBot):
             Resolution: {question.resolution_criteria}
             {lower_msg}
             {upper_msg}
+            {base_rate_str}
             Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
             Consider status quo, trends, expert views, and black swans.
+            If research is weak, widen your intervals significantly.
 
             Provide percentiles: 10, 20, 40, 60, 80, 90.
             """)
             reasoning = await self.get_llm("default", "llm").invoke(prompt)
             percentile_list: list[Percentile] = await structure_output(reasoning, list[Percentile], model=self.get_llm("parser", "llm"))
-            result = NumericDistribution.from_question(percentile_list, question)
+            
+            # Post-process: interpolate, enforce bounds & monotonicity
+            target_ps = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+            interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
+            validated = enforce_numeric_constraints(interpolated, question)
+            result = NumericDistribution.from_question(validated, question)
 
         if model_override:
             # Restore defaults
@@ -187,32 +322,53 @@ class ConservativeHybridBot(ForecastBot):
         return result, reasoning
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        forecasts = []
-        reasonings = []
         models = [
             "openrouter/openai/gpt-5",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5"
         ]
+        forecasts = []
+        reasonings = []
         for model in models:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await self._single_forecast(question, research, model_override=model)
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"Model {model} failed on binary Q{question.id}: {e}")
+                # Fallback: use base rate or 0.5
+                base = safe_community_prediction(question) or 0.5
+                forecasts.append(max(0.01, min(0.99, base)))
+                reasonings.append(f"FALLBACK due to error: {e}")
+
         median_pred = float(np.median(forecasts))
-        return ReasonedPrediction(prediction_value=median_pred, reasoning=" | ".join(reasonings))
+        final_reasoning = " | ".join(reasonings)
+        log_forecast_for_calibration(question, median_pred, final_reasoning, models, is_research_sufficient(research))
+        return ReasonedPrediction(prediction_value=median_pred, reasoning=final_reasoning)
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        forecasts = []
-        reasonings = []
         models = [
             "openrouter/openai/gpt-5",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5"
         ]
+        forecasts = []
+        reasonings = []
         for model in models:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await self._single_forecast(question, research, model_override=model)
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"Model {model} failed on MC Q{question.id}: {e}")
+                # Fallback: uniform distribution
+                n = len(question.options)
+                uniform = PredictedOptionList([
+                    {"option": opt, "probability": 1.0 / n} for opt in question.options
+                ])
+                forecasts.append(uniform)
+                reasonings.append(f"FALLBACK due to error: {e}")
+
         all_probs = np.array([[opt["probability"] for opt in f.predicted_options] for f in forecasts])
         median_probs = np.median(all_probs, axis=0)
         if median_probs.sum() > 0:
@@ -223,20 +379,46 @@ class ConservativeHybridBot(ForecastBot):
         median_forecast = PredictedOptionList([
             {"option": opt["option"], "probability": float(p)} for opt, p in zip(options, median_probs)
         ])
-        return ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
+        final_reasoning = " | ".join(reasonings)
+        log_forecast_for_calibration(question, [opt["probability"] for opt in median_forecast.predicted_options], final_reasoning, models, is_research_sufficient(research))
+        return ReasonedPrediction(prediction_value=median_forecast, reasoning=final_reasoning)
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        forecasts = []
-        reasonings = []
         models = [
             "openrouter/openai/gpt-5",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5"
         ]
+        forecasts = []
+        reasonings = []
         for model in models:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await self._single_forecast(question, research, model_override=model)
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"Model {model} failed on numeric Q{question.id}: {e}")
+                # Fallback: use base rate if available, else wide uniform
+                base = safe_community_prediction(question)
+                if base is not None:
+                    # Crude fallback: center around base
+                    width = (question.upper_bound - question.lower_bound) * 0.3
+                    center = base * (question.upper_bound - question.lower_bound) + question.lower_bound
+                    fallback_vals = [center - width, center - width*0.5, center, center, center + width*0.5, center + width]
+                else:
+                    fallback_vals = [
+                        question.lower_bound or 0,
+                        question.lower_bound or 0,
+                        (question.lower_bound + question.upper_bound)/2,
+                        (question.lower_bound + question.upper_bound)/2,
+                        question.upper_bound or 1,
+                        question.upper_bound or 1
+                    ]
+                fallback_ps = [Percentile(p, v) for p, v in zip([0.1,0.2,0.4,0.6,0.8,0.9], fallback_vals)]
+                fallback_dist = NumericDistribution.from_question(fallback_ps, question)
+                forecasts.append(fallback_dist)
+                reasonings.append(f"FALLBACK due to error: {e}")
+
         target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
         aggregated = []
         for p in target_percentiles:
@@ -247,11 +429,17 @@ class ConservativeHybridBot(ForecastBot):
                         values.append(item.value)
                         break
                 else:
-                    values.append(0.0)
+                    # Should not happen due to fallback, but just in case
+                    values.append((question.lower_bound + question.upper_bound) / 2)
             median_val = float(np.median(values))
             aggregated.append(Percentile(percentile=p, value=median_val))
-        distribution = NumericDistribution.from_question(aggregated, question)
-        return ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
+
+        # Final validation
+        validated = enforce_numeric_constraints(aggregated, question)
+        distribution = NumericDistribution.from_question(validated, question)
+        final_reasoning = " | ".join(reasonings)
+        log_forecast_for_calibration(question, [p.value for p in validated], final_reasoning, models, is_research_sufficient(research))
+        return ReasonedPrediction(prediction_value=distribution, reasoning=final_reasoning)
 
 
 # -----------------------------
@@ -263,7 +451,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "market-pulse-26q1", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
@@ -281,6 +469,6 @@ if __name__ == "__main__":
             reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
             all_reports.extend(reports)
         bot.log_report_summary(all_reports)
-        logger.info("Run completed successfully.")
+        logger.info(f"Run completed. Calibration logs saved to {CALIBRATION_LOG_FILE}")
     except Exception as e:
         logger.error(f"Critical error: {e}", exc_info=True)
