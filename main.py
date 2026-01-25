@@ -1,6 +1,6 @@
 # main.py
 # Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
-# Enhanced with forecasting best practices + fixed attribute errors
+# Fully fixed: no missing imports, no .id access, robust forecasting
 
 import argparse
 import asyncio
@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Any
+from typing import Literal, Optional, Any
 
 import numpy as np
 from forecasting_tools import (
