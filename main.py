@@ -1,17 +1,17 @@
 # main.py
 # Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
-# Enhanced with forecasting best practices (base rates, robust aggregation, calibration logging, etc.)
+# Enhanced with forecasting best practices + fixed attribute errors
 
 import argparse
 import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime
-from typing import Literal, Optional, Any
+from typing import Any
 
 import numpy as np
-import requests
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -48,19 +48,27 @@ logging.basicConfig(
 logger = logging.getLogger("ConservativeHybridBot")
 
 
+def extract_question_id(question: MetaculusQuestion) -> str:
+    """Extract question ID from URL since .id attribute may not be exposed."""
+    try:
+        url = getattr(question, 'url', '')
+        match = re.search(r'/questions/(\d+)', str(url))
+        return match.group(1) if match else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
     """Safely extract community prediction; return None if unavailable."""
     try:
-        # Adjust based on actual API: could be .community_prediction, .prediction, etc.
         pred = getattr(question, 'community_prediction', None)
         if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
             return float(pred)
-        # Fallback: some APIs use 'prediction' or 'latest_community_prediction'
         pred = getattr(question, 'prediction', None)
         if pred is not None and isinstance(pred, (int, float)) and 0 <= pred <= 1:
             return float(pred)
     except Exception as e:
-        logger.warning(f"Failed to get community prediction for Q{question.id}: {e}")
+        logger.warning(f"Failed to get community prediction for Q{extract_question_id(question)}: {e}")
     return None
 
 
@@ -68,7 +76,6 @@ def is_research_sufficient(research: str) -> bool:
     """Heuristic: research is sufficient if it contains non-error content from at least one source."""
     if not research or "failed" in research.lower():
         return False
-    # Require at least 50 chars of real content
     cleaned = research.replace("--- SOURCE", "").replace("Tavily failed", "").replace("NewsAPI failed", "")
     return len(cleaned.strip()) > 50
 
@@ -81,7 +88,6 @@ def interpolate_missing_percentiles(
     if not reported:
         return [Percentile(p, 0.0) for p in target_percentiles]
 
-    # Sort by percentile
     sorted_rep = sorted(reported, key=lambda x: x.percentile)
     xs = [p.percentile for p in sorted_rep]
     ys = [p.value for p in sorted_rep]
@@ -91,7 +97,6 @@ def interpolate_missing_percentiles(
         if tp in xs:
             val = ys[xs.index(tp)]
         else:
-            # Linear interpolation
             from bisect import bisect_left
             i = bisect_left(xs, tp)
             if i == 0:
@@ -114,13 +119,11 @@ def enforce_numeric_constraints(
     lower = question.lower_bound if not question.open_lower_bound else -np.inf
     upper = question.upper_bound if not question.open_upper_bound else np.inf
 
-    # Apply bounds
     bounded = []
     for p in percentiles:
         val = max(lower, min(upper, p.value))
         bounded.append(Percentile(percentile=p.percentile, value=val))
 
-    # Enforce monotonicity (non-decreasing)
     sorted_by_p = sorted(bounded, key=lambda x: x.percentile)
     values = [p.value for p in sorted_by_p]
     for i in range(1, len(values)):
@@ -143,7 +146,7 @@ def log_forecast_for_calibration(
     """Log forecast details for post-resolution scoring."""
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
-        "question_id": question.id,
+        "question_id": extract_question_id(question),
         "question_type": question.__class__.__name__,
         "question_text": question.question_text,
         "resolution_date": getattr(question, 'resolution_date', None),
@@ -151,7 +154,7 @@ def log_forecast_for_calibration(
         "prediction_value": prediction_value,
         "models_used": model_ids,
         "research_used": research_used,
-        "reasoning_snippet": reasoning[:500]  # truncate
+        "reasoning_snippet": reasoning[:500]
     }
     try:
         with open(CALIBRATION_LOG_FILE, "a") as f:
@@ -170,7 +173,6 @@ class ConservativeHybridBot(ForecastBot):
     - Enhanced with base rates, robust aggregation, and calibration logging
     """
 
-    # Slightly increased concurrency; adjust based on API limits
     _max_concurrent_questions = 3
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -308,14 +310,12 @@ class ConservativeHybridBot(ForecastBot):
             reasoning = await self.get_llm("default", "llm").invoke(prompt)
             percentile_list: list[Percentile] = await structure_output(reasoning, list[Percentile], model=self.get_llm("parser", "llm"))
             
-            # Post-process: interpolate, enforce bounds & monotonicity
             target_ps = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
             interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
             validated = enforce_numeric_constraints(interpolated, question)
             result = NumericDistribution.from_question(validated, question)
 
         if model_override:
-            # Restore defaults
             self._llms["default"] = GeneralLlm(model="openrouter/openai/gpt-5")
             self._llms["parser"] = GeneralLlm(model="openrouter/openai/gpt-4.1-mini")
 
@@ -335,8 +335,7 @@ class ConservativeHybridBot(ForecastBot):
                 forecasts.append(pred)
                 reasonings.append(reason)
             except Exception as e:
-                logger.warning(f"Model {model} failed on binary Q{question.id}: {e}")
-                # Fallback: use base rate or 0.5
+                logger.warning(f"Model {model} failed on binary Q{extract_question_id(question)}: {e}")
                 base = safe_community_prediction(question) or 0.5
                 forecasts.append(max(0.01, min(0.99, base)))
                 reasonings.append(f"FALLBACK due to error: {e}")
@@ -360,8 +359,7 @@ class ConservativeHybridBot(ForecastBot):
                 forecasts.append(pred)
                 reasonings.append(reason)
             except Exception as e:
-                logger.warning(f"Model {model} failed on MC Q{question.id}: {e}")
-                # Fallback: uniform distribution
+                logger.warning(f"Model {model} failed on MC Q{extract_question_id(question)}: {e}")
                 n = len(question.options)
                 uniform = PredictedOptionList([
                     {"option": opt, "probability": 1.0 / n} for opt in question.options
@@ -397,11 +395,9 @@ class ConservativeHybridBot(ForecastBot):
                 forecasts.append(pred)
                 reasonings.append(reason)
             except Exception as e:
-                logger.warning(f"Model {model} failed on numeric Q{question.id}: {e}")
-                # Fallback: use base rate if available, else wide uniform
+                logger.warning(f"Model {model} failed on numeric Q{extract_question_id(question)}: {e}")
                 base = safe_community_prediction(question)
                 if base is not None:
-                    # Crude fallback: center around base
                     width = (question.upper_bound - question.lower_bound) * 0.3
                     center = base * (question.upper_bound - question.lower_bound) + question.lower_bound
                     fallback_vals = [center - width, center - width*0.5, center, center, center + width*0.5, center + width]
@@ -429,12 +425,10 @@ class ConservativeHybridBot(ForecastBot):
                         values.append(item.value)
                         break
                 else:
-                    # Should not happen due to fallback, but just in case
                     values.append((question.lower_bound + question.upper_bound) / 2)
             median_val = float(np.median(values))
             aggregated.append(Percentile(percentile=p, value=median_val))
 
-        # Final validation
         validated = enforce_numeric_constraints(aggregated, question)
         distribution = NumericDistribution.from_question(validated, question)
         final_reasoning = " | ".join(reasonings)
@@ -451,7 +445,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "market-pulse-26q1", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["32916", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
     )
     args = parser.parse_args()
 
