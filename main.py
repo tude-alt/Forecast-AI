@@ -48,28 +48,30 @@ logger = logging.getLogger("ConservativeHybridBot")
 # Timeouts & Limits
 # -----------------------------
 RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "25"))
-LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "60"))
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "70"))  # slightly higher for 5.2 JSON reliability
 
 # Extremization & calibration controls
-EXTREMIZE_THRESHOLD = float(os.getenv("EXTREMIZE_THRESHOLD", "0.60"))     # legacy threshold
-EXTREMIZE_ALPHA = float(os.getenv("EXTREMIZE_ALPHA", "1.35"))            # default gentler alpha (ROI: less overconfidence)
+EXTREMIZE_THRESHOLD = float(os.getenv("EXTREMIZE_THRESHOLD", "0.60"))
+EXTREMIZE_ALPHA = float(os.getenv("EXTREMIZE_ALPHA", "1.35"))
 EXTREMIZE_ALPHA_STRONG = float(os.getenv("EXTREMIZE_ALPHA_STRONG", "1.80"))
-EXTREMIZE_DISPERSION_STD_MAX = float(os.getenv("EXTREMIZE_DISPERSION_STD_MAX", "0.06"))  # extremize only if committee agrees
+EXTREMIZE_DISPERSION_STD_MAX = float(os.getenv("EXTREMIZE_DISPERSION_STD_MAX", "0.06"))
 
-# Crowd/model shrinkage (ROI: improves calibration)
-CROWD_BLEND_WEAK = float(os.getenv("CROWD_BLEND_WEAK", "0.45"))    # weight on model when evidence weak
+# Crowd/model shrinkage
+CROWD_BLEND_WEAK = float(os.getenv("CROWD_BLEND_WEAK", "0.45"))
 CROWD_BLEND_MIXED = float(os.getenv("CROWD_BLEND_MIXED", "0.65"))
 CROWD_BLEND_STRONG = float(os.getenv("CROWD_BLEND_STRONG", "0.80"))
 
 MIN_P = float(os.getenv("MIN_P", "0.01"))
 MAX_P = float(os.getenv("MAX_P", "0.99"))
 
+# Never forecast without research: require at least one meaningful source
+REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true", "yes")
+
 # Calibration logging helper
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 
 def extract_question_id(question: MetaculusQuestion) -> str:
-    """Extract question ID from URL since .id attribute may not be exposed."""
     try:
         url = getattr(question, "url", "")
         match = re.search(r"/questions/(\d+)", str(url))
@@ -81,7 +83,8 @@ def extract_question_id(question: MetaculusQuestion) -> str:
 def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
     """
     Best-effort extraction of a scalar community anchor.
-    Note: Metaculus objects can vary; this returns None if not a float.
+    For binary this is typically a probability (0..1).
+    For numeric/MC it may be non-scalar; we ignore those.
     """
     try:
         pred = getattr(question, "community_prediction", None)
@@ -109,40 +112,35 @@ def logit(p: float) -> float:
 
 
 def extremize_probability(p: float, alpha: float) -> float:
-    """Extremize probability using logit scaling: p' = sigmoid(alpha * logit(p))."""
     return clamp01(sigmoid(alpha * logit(p)))
 
 
 def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
-    """Legacy: extremize if p >= threshold or p <= 1-threshold."""
     return (p >= threshold) or (p <= (1.0 - threshold))
 
 
+def is_meaningful_research_text(txt: str) -> bool:
+    if not txt:
+        return False
+    low = txt.lower()
+    if "failed:" in low or "error:" in low or "timeout" in low:
+        return False
+    return len(txt.strip()) > 120
+
+
 def is_research_sufficient(research_by_source: Dict[str, str]) -> bool:
-    """Research is sufficient if at least one source has meaningful non-error content."""
     if not research_by_source:
         return False
-
-    def good(txt: str) -> bool:
-        if not txt:
-            return False
-        low = txt.lower()
-        # Treat pure failures as bad
-        if ("failed:" in low or "error:" in low or "timeout" in low) and len(txt.strip()) < 200:
-            return False
-        return len(txt.strip()) > 120
-
-    return any(good(v) for v in research_by_source.values())
+    return any(is_meaningful_research_text(v) for v in research_by_source.values())
 
 
 def interpolate_missing_percentiles(reported: list[Percentile], target_percentiles: list[float]) -> list[Percentile]:
-    """Interpolate missing percentiles using linear interpolation on available ones."""
     if not reported:
         return [Percentile(percentile=p, value=0.0) for p in target_percentiles]
 
     sorted_rep = sorted(reported, key=lambda x: x.percentile)
-    xs = [p.percentile for p in sorted_rep]
-    ys = [p.value for p in sorted_rep]
+    xs = [float(p.percentile) for p in sorted_rep]
+    ys = [float(p.value) for p in sorted_rep]
 
     interpolated: List[Percentile] = []
     for tp in target_percentiles:
@@ -159,12 +157,11 @@ def interpolate_missing_percentiles(reported: list[Percentile], target_percentil
                 x0, x1 = xs[i - 1], xs[i]
                 y0, y1 = ys[i - 1], ys[i]
                 val = y0 + (y1 - y0) * (tp - x0) / (x1 - x0) if x1 != x0 else y0
-        interpolated.append(Percentile(percentile=tp, value=float(val)))
+        interpolated.append(Percentile(percentile=float(tp), value=float(val)))
     return interpolated
 
 
 def enforce_numeric_constraints(percentiles: list[Percentile], question: NumericQuestion) -> list[Percentile]:
-    """Enforce bounds and monotonicity."""
     lower = -np.inf if getattr(question, "open_lower_bound", False) else getattr(question, "lower_bound", None)
     upper = np.inf if getattr(question, "open_upper_bound", False) else getattr(question, "upper_bound", None)
 
@@ -180,9 +177,9 @@ def enforce_numeric_constraints(percentiles: list[Percentile], question: Numeric
 
     bounded: List[Percentile] = []
     for p in percentiles:
-        val = float(p.value)
-        val = max(lower, min(upper, val))
-        bounded.append(Percentile(percentile=float(p.percentile), value=float(val)))
+        v = float(p.value)
+        v = max(lower, min(upper, v))
+        bounded.append(Percentile(percentile=float(p.percentile), value=float(v)))
 
     sorted_by_p = sorted(bounded, key=lambda x: x.percentile)
     values = [p.value for p in sorted_by_p]
@@ -194,10 +191,6 @@ def enforce_numeric_constraints(percentiles: list[Percentile], question: Numeric
 
 
 def derive_numeric_fallback_bounds(question: NumericQuestion, anchor: Optional[float]) -> Tuple[float, float]:
-    """
-    ROI: numeric questions often have open bounds; never default to 0..1.
-    Prefer (closed bounds) > (nominal bounds) > (anchor-based bounds) > wide generic.
-    """
     lb = getattr(question, "lower_bound", None)
     ub = getattr(question, "upper_bound", None)
 
@@ -206,33 +199,27 @@ def derive_numeric_fallback_bounds(question: NumericQuestion, anchor: Optional[f
     if ub is None:
         ub = getattr(question, "nominal_upper_bound", None)
 
-    open_lb = getattr(question, "open_lower_bound", False)
-    open_ub = getattr(question, "open_upper_bound", False)
-
-    # If bounds are present but open flags are True, still treat as None for clipping range
-    if open_lb:
+    if getattr(question, "open_lower_bound", False):
         lb = None
-    if open_ub:
+    if getattr(question, "open_upper_bound", False):
         ub = None
 
-    if lb is not None and ub is not None and ub > lb:
+    if lb is not None and ub is not None and float(ub) > float(lb):
         return float(lb), float(ub)
 
     if isinstance(anchor, (int, float)):
         a = float(anchor)
         if a > 0:
-            return float(a * 0.25), float(a * 3.0)
-        return float(a - 1.0), float(a + 1.0)
+            return a * 0.25, a * 3.0
+        return a - 1.0, a + 1.0
 
-    # last resort: extremely wide, but finite
     return -1e9, 1e9
 
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
-    """Create a single research string with explicit source sections."""
     blocks: List[str] = []
     for src in ["tavily", "newsapi"]:
-        if src in research_by_source:
+        if src in research_by_source and research_by_source[src]:
             blocks.append(f"--- SOURCE {src.upper()} ---\n{research_by_source[src]}\n")
     for src, txt in research_by_source.items():
         if src not in ("tavily", "newsapi"):
@@ -248,7 +235,6 @@ def log_forecast_for_calibration(
     research_used: bool,
     searchers_used: list[str],
 ):
-    """Log forecast details for post-resolution scoring."""
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "question_id": extract_question_id(question),
@@ -286,7 +272,6 @@ def build_comment(
     searchers_used: List[str],
     models_used: List[str],
 ) -> str:
-    """Metaculus report/comment text: question, forecast, how arrived at, and searchers used."""
     qtxt = getattr(question, "question_text", "").strip()
     qid = extract_question_id(question)
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -312,13 +297,16 @@ def build_comment(
 
 class ConservativeHybridBot(ForecastBot):
     """
-    High-ROI tournament bot:
-    - Fixes ForecastBot integration: run_research returns str only (prevents ResearchWithPredictions validation error)
-    - Research: Tavily + NewsAPI (publishedAt), synthesized by GPT-5.2
-    - Robust structured outputs: forecasters emit JSON ONLY (prevents "No JSON found" parser failures)
-    - Binary: committee aggregation in logit space + (optional) extremization gated by agreement + evidence
-      and crowd/model shrinkage blending (improves calibration/log score)
-    - Numeric: reliable percentile JSON + sensible fallbacks (never 0..1 for open bounds)
+    Tournament bot (high-ROI):
+    - run_research returns str only; meta stored separately
+    - Research pipeline:
+        1) GPT-5.2 generates query expansions ("web search brain")
+        2) Tavily + NewsAPI runs on expanded queries
+        3) GPT-5.2 synthesizes evidence summary
+      => never forecast without at least one meaningful research source
+    - Forecasters output JSON-only (stable parsing)
+    - No GPT-5 as forecaster (removed); GPT-5.2 is the primary forecaster
+    - Good Judgment principles + base rates: prompts + crowd/model blending
     """
 
     _max_concurrent_questions = 3
@@ -326,9 +314,10 @@ class ConservativeHybridBot(ForecastBot):
 
     def _llm_config_defaults(self) -> dict[str, str]:
         return {
-            "default": "openrouter/openai/gpt-5",
+            # Forecasters: gpt-5.2 primary
+            "default": "openrouter/openai/gpt-5.2",
             "parser": "openrouter/openai/gpt-4.1-mini",
-            "summarizer": "openrouter/openai/gpt-5",
+            # Researcher/synth/query-expander: gpt-5.2
             "researcher": "openrouter/openai/gpt-5.2",
         }
 
@@ -336,12 +325,10 @@ class ConservativeHybridBot(ForecastBot):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
-
-        # Store meta without breaking ForecastBot schema
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
     # -----------------------------
-    # Multi-Source Research (Tavily + NewsAPI) + GPT-5.2 synthesis
+    # Research helpers
     # -----------------------------
     def call_tavily(self, query: str) -> str:
         if not getattr(self.tavily_client, "api_key", None):
@@ -354,10 +341,7 @@ class ConservativeHybridBot(ForecastBot):
                 content = (c.get("content") or "").strip()
                 url = (c.get("url") or "").strip()
                 if content:
-                    if url:
-                        lines.append(f"- {content}\n  Source: {url}")
-                    else:
-                        lines.append(f"- {content}")
+                    lines.append(f"- {content}\n  Source: {url or 'N/A'}")
             return "\n".join(lines).strip()
         except Exception as e:
             return f"Tavily failed: {e}"
@@ -366,12 +350,11 @@ class ConservativeHybridBot(ForecastBot):
         if not getattr(self.newsapi_client, "api_key", None):
             return ""
         try:
-            # ROI: recency is usually more important than "relevancy" for Metaculus
             articles = self.newsapi_client.get_everything(
                 q=query,
                 language="en",
-                sort_by="publishedAt",
-                page_size=8,
+                sort_by="publishedAt",  # recency-first for forecasting
+                page_size=10,
             )
             arts = (articles or {}).get("articles", []) or []
             lines: List[str] = []
@@ -391,63 +374,113 @@ class ConservativeHybridBot(ForecastBot):
         except Exception as e:
             return f"NewsAPI failed: {e}"
 
+    async def _expand_queries_with_gpt52(self, question_text: str) -> List[str]:
+        """
+        Use GPT-5.2 to propose search queries that improve recall/precision.
+        Returns a short list of distinct query strings.
+        """
+        researcher_llm = self.get_llm("researcher", "llm")
+        prompt = clean_indents(f"""
+        Generate 5 concise web search queries to research this forecasting question.
+        Mix: (1) exact entities, (2) key event terms, (3) likely resolution criteria terms, (4) newest updates.
+        Avoid quotes unless needed. Do NOT include explanations.
+
+        Output JSON ONLY: {{"queries":["...","..."]}}
+
+        Question: {question_text}
+        """).strip()
+        raw = await with_timeout(researcher_llm.invoke(prompt), 35, "query_expand")
+        try:
+            data = json.loads(raw)
+            qs = data.get("queries", [])
+            qs = [str(x).strip() for x in qs if str(x).strip()]
+            # include original question text as first query
+            merged = [question_text.strip()] + qs
+            # unique while preserving order
+            seen = set()
+            out = []
+            for q in merged:
+                key = q.lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(q)
+            return out[:6]
+        except Exception:
+            # fallback: just original question
+            return [question_text.strip()]
+
     async def _run_research_impl(self, question: MetaculusQuestion) -> Tuple[str, Dict[str, str], List[str]]:
         async with self._concurrency_limiter:
-            q = getattr(question, "question_text", "") or ""
+            qtxt = (getattr(question, "question_text", "") or "").strip()
+            if not qtxt:
+                return "", {}, []
 
-            tav = await with_timeout(asyncio.to_thread(self.call_tavily, q), RESEARCH_TIMEOUT_S, "tavily")
-            nws = await with_timeout(asyncio.to_thread(self.call_newsapi, q), RESEARCH_TIMEOUT_S, "newsapi")
+            # 1) GPT-5.2 query expansion ("web search brain")
+            expanded_queries = await self._expand_queries_with_gpt52(qtxt)
 
-            research_by_source = {"tavily": tav, "newsapi": nws}
+            # 2) Run Tavily + NewsAPI across top queries (cap to avoid rate limits)
+            tav_parts: List[str] = []
+            nws_parts: List[str] = []
 
-            # Only count as "used" if it has meaningful content
-            def meaningful(txt: str) -> bool:
-                if not txt:
-                    return False
-                low = txt.lower()
-                if "failed:" in low or "error:" in low or "timeout" in low:
-                    return False
-                return len(txt.strip()) > 120
+            # try up to 3 queries max for each tool to control spend/latency
+            for i, q in enumerate(expanded_queries[:3]):
+                tav = await with_timeout(asyncio.to_thread(self.call_tavily, q), RESEARCH_TIMEOUT_S, f"tavily_{i}")
+                if tav and "failed:" not in tav.lower() and "error:" not in tav.lower():
+                    tav_parts.append(f"## Query: {q}\n{tav}")
 
-            searchers_used = [s for s in ["tavily", "newsapi"] if meaningful(research_by_source.get(s, ""))]
+                nws = await with_timeout(asyncio.to_thread(self.call_newsapi, q), RESEARCH_TIMEOUT_S, f"newsapi_{i}")
+                if nws and "failed:" not in nws.lower() and "error:" not in nws.lower():
+                    nws_parts.append(f"## Query: {q}\n{nws}")
 
-            raw_block = format_research_block(research_by_source)
+            tav_all = "\n\n".join(tav_parts).strip()
+            nws_all = "\n\n".join(nws_parts).strip()
+
+            research_by_source = {"tavily": tav_all, "newsapi": nws_all}
+            searchers_used = [s for s in ["tavily", "newsapi"] if is_meaningful_research_text(research_by_source.get(s, ""))]
+
             sufficient = is_research_sufficient(research_by_source)
+            raw_block = format_research_block(research_by_source)
 
-            if not sufficient:
-                synthesized = "(Insufficient recent research found via Tavily/NewsAPI. Relying more on base rates and general knowledge.)"
-                return (synthesized + ("\n\n" + raw_block if raw_block else "")).strip(), research_by_source, searchers_used
+            if REQUIRE_RESEARCH and not sufficient:
+                # never forecast without research
+                raise RuntimeError(f"Insufficient research for Q{extract_question_id(question)}; refusing to forecast.")
 
+            # 3) GPT-5.2 synthesis
             researcher_llm = self.get_llm("researcher", "llm")
             synth_prompt = clean_indents(f"""
             You are an expert research synthesizer for forecasting.
 
-            Task: Summarize evidence relevant to the question. Be concrete, cautious, and include dates when present.
-            Each key fact MUST end with [TAVILY] or [NEWSAPI] or both.
-            If evidence is weak/outdated, say so.
+            Task: Summarize evidence relevant to the question.
+            Requirements:
+            - Prioritize RECENT developments (include dates if present).
+            - Each key fact MUST end with [TAVILY] or [NEWSAPI] or both.
+            - Separate facts from speculation.
+            - Explicitly list what would change the forecast.
 
-            Question: {q}
+            Question: {qtxt}
 
             Raw research:
             {raw_block}
 
-            Output format (plain text):
-            - Key facts (bullets with dates where possible; end each with [TAVILY]/[NEWSAPI])
+            Output (plain text):
+            - Key facts (bullets; include dates; end tags)
             - What remains uncertain (bullets)
-            - Likely drivers going forward (bullets)
-            Keep it under ~2200 characters.
+            - Likely drivers / signposts (bullets)
+            - What would change the forecast (bullets)
+            Keep it under ~2400 characters.
             """).strip()
 
             synthesized = await with_timeout(researcher_llm.invoke(synth_prompt), LLM_TIMEOUT_S, "research_synthesis")
             synthesized = (synthesized or "").strip()
-            if not synthesized:
-                synthesized = "(Research synthesis returned empty. Relying more on base rates and general knowledge.)"
+            if REQUIRE_RESEARCH and not synthesized:
+                raise RuntimeError(f"Empty synthesis for Q{extract_question_id(question)}; refusing to forecast.")
+
             return synthesized, research_by_source, searchers_used
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
-        ForecastBot expects a STRING research_report.
-        We store meta on self._research_meta keyed by QID for logging.
+        ForecastBot expects a STRING for research_report.
+        Store meta separately.
         """
         synthesized, research_by_source, searchers_used = await self._run_research_impl(question)
         qid = extract_question_id(question)
@@ -456,42 +489,49 @@ class ConservativeHybridBot(ForecastBot):
             "raw": research_by_source,
             "searchers_used": searchers_used,
         }
-        # Optional: log type info to debug misclassification
         logger.info(
             f"Q{qid} class={type(question).__name__} "
-            f"options={getattr(question,'options',None)} "
             f"bounds=({getattr(question,'lower_bound',None)},{getattr(question,'upper_bound',None)}) "
-            f"open_bounds=({getattr(question,'open_lower_bound',None)},{getattr(question,'open_upper_bound',None)})"
+            f"open_bounds=({getattr(question,'open_lower_bound',None)},{getattr(question,'open_upper_bound',None)}) "
+            f"searchers_used={searchers_used}"
         )
         return synthesized
 
     # -----------------------------
-    # Forecasting core (no shared-state mutation)
+    # Forecasting core (JSON-only outputs)
     # -----------------------------
     async def _single_forecast(self, question, research: str, model_override: str = None):
-        """
-        Returns (result, raw_text).
-        IMPORTANT: does NOT mutate shared llm state.
-        Outputs are JSON-only to avoid parser failures (ROI).
-        """
         llm = GeneralLlm(model=model_override) if model_override else self.get_llm("default", "llm")
         parser_llm = self.get_llm("parser", "llm")
+
+        # Never forecast without research (belt & suspenders)
+        if REQUIRE_RESEARCH and (not research or len(research.strip()) < 80):
+            raise RuntimeError(f"Missing/insufficient research text for Q{extract_question_id(question)}; refusing to forecast.")
 
         base_rate = safe_community_prediction(question)
         if base_rate is not None:
             if isinstance(question, BinaryQuestion):
-                base_rate_str = f"Community prediction (anchor): {base_rate:.3f} (decimal probability)"
+                base_rate_str = f"Community prediction (anchor): {base_rate:.4f} (decimal probability)"
             else:
-                base_rate_str = f"Community prediction (anchor, scalar): {base_rate:,.6g}"
+                base_rate_str = f"Community scalar anchor (if meaningful): {base_rate:,.6g}"
         else:
             base_rate_str = "No reliable community anchor available."
 
         today_utc = datetime.utcnow().strftime("%Y-%m-%d")
 
+        good_judgment_guidance = clean_indents("""
+        Good Judgment principles:
+        - Start with an outside view (base rate/reference class), then update with evidence (inside view).
+        - Consider time-to-resolution and path dependence.
+        - Weigh evidence by credibility + recency; discount stale/noisy signals.
+        - Prefer calibrated uncertainty: avoid needless overconfidence.
+        """).strip()
+
         if isinstance(question, BinaryQuestion):
             prompt = clean_indents(f"""
             You are a tournament forecaster optimizing for log score.
-            Use base rates as anchors, but update with evidence.
+
+            {good_judgment_guidance}
 
             Question: {question.question_text}
             Background: {question.background_info}
@@ -500,7 +540,7 @@ class ConservativeHybridBot(ForecastBot):
 
             {base_rate_str}
 
-            Research summary:
+            Research summary (must use this; do not guess beyond it):
             {research}
 
             Today (UTC): {today_utc}
@@ -513,12 +553,13 @@ class ConservativeHybridBot(ForecastBot):
 
             raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "binary_llm")
             pred: BinaryPrediction = await structure_output(raw, BinaryPrediction, model=parser_llm)
-            result = clamp01(float(pred.prediction_in_decimal))
-            return result, str(raw)
+            return clamp01(float(pred.prediction_in_decimal)), str(raw)
 
         if isinstance(question, MultipleChoiceQuestion):
             prompt = clean_indents(f"""
             You are a tournament forecaster optimizing for log score.
+
+            {good_judgment_guidance}
 
             Question: {question.question_text}
             Options (exact strings): {question.options}
@@ -527,7 +568,7 @@ class ConservativeHybridBot(ForecastBot):
 
             {base_rate_str}
 
-            Research summary:
+            Research summary (must use this; do not guess beyond it):
             {research}
 
             Today (UTC): {today_utc}
@@ -565,7 +606,8 @@ class ConservativeHybridBot(ForecastBot):
 
             prompt = clean_indents(f"""
             You are a tournament forecaster optimizing for log score.
-            Provide a calibrated distribution (avoid overconfidence).
+
+            {good_judgment_guidance}
 
             Question: {question.question_text}
             Units: {question.unit_of_measure or 'Infer from context'}
@@ -576,7 +618,7 @@ class ConservativeHybridBot(ForecastBot):
 
             {base_rate_str}
 
-            Research summary:
+            Research summary (must use this; do not guess beyond it):
             {research}
 
             Today (UTC): {today_utc}
@@ -597,7 +639,7 @@ class ConservativeHybridBot(ForecastBot):
             interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
             validated = enforce_numeric_constraints(interpolated, question)
 
-            # sanity: if everything is identical (degenerate), widen slightly within bounds
+            # If degenerate, widen within fallback bounds
             vals = [p.value for p in validated]
             if len(set([round(v, 12) for v in vals])) == 1:
                 lb, ub = derive_numeric_fallback_bounds(question, base_rate)
@@ -613,8 +655,7 @@ class ConservativeHybridBot(ForecastBot):
                 ]
                 validated = enforce_numeric_constraints(widened, question)
 
-            result = NumericDistribution.from_question(validated, question)
-            return result, str(raw)
+            return NumericDistribution.from_question(validated, question), str(raw)
 
         raise ValueError(f"Unsupported question type: {type(question)}")
 
@@ -622,8 +663,9 @@ class ConservativeHybridBot(ForecastBot):
     # Binary: committee + agreement-gated extremization + crowd shrinkage
     # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
+        # Remove GPT-5; add GPT-5.2
         models = [
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.2",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
@@ -632,14 +674,13 @@ class ConservativeHybridBot(ForecastBot):
         base = safe_community_prediction(question)
         base_rate_text = f"{base:.1%}" if isinstance(base, (int, float)) else "None"
 
-        # evidence strength label (used for blending + extremization)
         evidence_strength: Literal["STRONG", "MIXED", "WEAK"] = "MIXED"
         try:
             researcher_llm = self.get_llm("researcher", "llm")
             strength_prompt = clean_indents(f"""
             Rate evidence strength for this forecast as exactly one token: STRONG, MIXED, or WEAK.
 
-            STRONG: multiple credible signals, little plausible reversal
+            STRONG: multiple credible recent signals, little plausible reversal
             MIXED: some evidence but meaningful uncertainty remains
             WEAK: thin/noisy/dated evidence
 
@@ -656,32 +697,28 @@ class ConservativeHybridBot(ForecastBot):
         except Exception as e:
             logger.debug(f"Evidence strength check failed for Q{qid}: {e}")
 
-        # Collect committee forecasts
         raw_ps: List[float] = []
         model_notes: List[str] = []
 
         for model in models:
             try:
-                p, raw = await self._single_forecast(question, research, model_override=model)
+                p, _raw = await self._single_forecast(question, research, model_override=model)
                 p = float(p)
                 raw_ps.append(clamp01(p))
                 model_notes.append(f"- model={model} p={p:.3f}")
             except Exception as e:
                 logger.warning(f"Model {model} failed on binary Q{qid}: {e}")
-                fallback = clamp01(base if isinstance(base, (int, float)) else 0.5)
+                # if research exists but model fails, fall back to crowd if available, else 0.5
+                fallback = clamp01(float(base) if isinstance(base, (int, float)) else 0.5)
                 raw_ps.append(fallback)
                 model_notes.append(f"- model={model} FALLBACK p={fallback:.3f} err={e}")
 
-        # Aggregate in logit space (better behaved)
         logits = np.array([logit(p) for p in raw_ps], dtype=float)
-        logit_med = float(np.median(logits))
-        p_agg = clamp01(sigmoid(logit_med))
+        p_agg = clamp01(sigmoid(float(np.median(logits))))
 
-        # Agreement metric
         p_std = float(np.std(raw_ps))
         agree = p_std <= EXTREMIZE_DISPERSION_STD_MAX
 
-        # Optional extremization: only if (a) committee agrees AND (b) p is away from 0.5 AND (c) evidence not WEAK
         alpha = EXTREMIZE_ALPHA_STRONG if evidence_strength == "STRONG" else EXTREMIZE_ALPHA
         p_final = p_agg
         did_ext = False
@@ -689,28 +726,25 @@ class ConservativeHybridBot(ForecastBot):
             p_final = extremize_probability(p_agg, alpha=alpha)
             did_ext = True
 
-        # Crowd shrinkage blending (ROI)
+        # Blend with crowd anchor (base rate) if available
         if isinstance(base, (int, float)):
             w = CROWD_BLEND_MIXED
             if evidence_strength == "WEAK":
                 w = CROWD_BLEND_WEAK
             elif evidence_strength == "STRONG":
                 w = CROWD_BLEND_STRONG
-
-            # also penalize w when models disagree
             if not agree:
                 w = max(0.35, w - 0.20)
-
             p_final = clamp01(w * p_final + (1.0 - w) * float(base))
 
         forecast_text = f"{p_final:.1%}"
 
-        # searchers used from cached meta (more accurate than string matching)
         meta = self._research_meta.get(qid, {})
         searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
-        - 3-model committee; aggregated in logit space (median of logits).
+        - Base rates + Good Judgment updating: start from crowd anchor when available; update using research evidence.
+        - 3-model committee; aggregated in logit space (median logits).
         - Agreement check: std={p_std:.3f} (extremize only if <= {EXTREMIZE_DISPERSION_STD_MAX:.2f}).
         - Extremization: {'YES' if did_ext else 'NO'} (threshold={EXTREMIZE_THRESHOLD:.2f}, alpha={alpha:.2f}, evidence={evidence_strength}).
         - Crowd/model blending: {'YES' if isinstance(base,(int,float)) else 'NO'} (evidence={evidence_strength}, agreement={agree}).
@@ -736,13 +770,13 @@ class ConservativeHybridBot(ForecastBot):
         return ReasonedPrediction(prediction_value=p_final, reasoning=comment)
 
     # -----------------------------
-    # Multiple choice: committee median by option key + prob floor
+    # Multiple choice: committee median by option key + probability floor
     # -----------------------------
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         models = [
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.2",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
@@ -756,7 +790,7 @@ class ConservativeHybridBot(ForecastBot):
 
         for model in models:
             try:
-                pred, raw = await self._single_forecast(question, research, model_override=model)
+                pred, _raw = await self._single_forecast(question, research, model_override=model)
                 m: Dict[str, float] = {}
                 for item in pred.predicted_options:
                     opt = item["option"]
@@ -785,7 +819,6 @@ class ConservativeHybridBot(ForecastBot):
         mat = np.array([[m[opt] for opt in option_list] for m in per_model_maps], dtype=float)
         med = np.median(mat, axis=0)
 
-        # ROI: small probability floor to reduce catastrophic log loss when surprised
         n = len(option_list)
         floor = max(1e-6, 0.01 / n)
         med = np.maximum(med, floor)
@@ -800,8 +833,9 @@ class ConservativeHybridBot(ForecastBot):
         searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
+        - Base rates + Good Judgment updating: use research-driven inside-view adjustments with conservative uncertainty.
         - 3-model committee; median probability per option.
-        - Applied probability floor={floor:.6f} then renormalized.
+        - Applied probability floor={floor:.6f} then renormalized (reduces catastrophic log loss on surprises).
         """).strip()
 
         comment = build_comment(
@@ -830,7 +864,7 @@ class ConservativeHybridBot(ForecastBot):
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         models = [
-            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.2",
             "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
@@ -845,7 +879,7 @@ class ConservativeHybridBot(ForecastBot):
 
         for model in models:
             try:
-                dist, raw = await self._single_forecast(question, research, model_override=model)
+                dist, _raw = await self._single_forecast(question, research, model_override=model)
                 declared = list(getattr(dist, "declared_percentiles", [])) or []
                 interpolated = interpolate_missing_percentiles(declared, target_percentiles)
                 validated = enforce_numeric_constraints(interpolated, question)
@@ -870,13 +904,11 @@ class ConservativeHybridBot(ForecastBot):
                     center + width * 0.5,
                     center + width * 0.9,
                 ]
-                # clip to bounds
                 fallback_vals = [max(lb, min(ub, v)) for v in fallback_vals]
                 fallback_ps = [Percentile(percentile=p, value=v) for p, v in zip(target_percentiles, fallback_vals)]
                 per_model_percentiles.append(enforce_numeric_constraints(fallback_ps, question))
                 model_notes.append(f"- model={model} FALLBACK bounds=({lb:.3g},{ub:.3g}) err={e}")
 
-        # Median per percentile
         aggregated: List[Percentile] = []
         for idx, p in enumerate(target_percentiles):
             vals = [pm[idx].value for pm in per_model_percentiles]
@@ -884,16 +916,14 @@ class ConservativeHybridBot(ForecastBot):
 
         validated = enforce_numeric_constraints(aggregated, question)
         distribution = NumericDistribution.from_question(validated, question)
-
         forecast_text = ", ".join([f"p{int(p.percentile*100)}={p.value:,.6g}" for p in validated])
 
         meta = self._research_meta.get(qid, {})
         searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
-        - 3-model committee.
-        - Forced percentiles onto {', '.join(str(int(p*100)) for p in target_percentiles)} via interpolation,
-          enforced bounds + monotonicity, then took median value per percentile.
+        - Base rates + Good Judgment updating: combine outside-view anchoring with research-driven updates.
+        - 3-model committee; interpolate to fixed percentiles then enforce bounds + monotonicity; median per percentile.
         - Numeric fallbacks never assume 0..1; they derive bounds from question/nominals/anchor.
         """).strip()
 
@@ -926,7 +956,12 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["32916", "minibench", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=[
+            "32916",
+            "minibench",
+            "market-pulse-26q1",
+            MetaculusApi.CURRENT_MINIBENCH_ID,
+        ],
     )
     args = parser.parse_args()
 
