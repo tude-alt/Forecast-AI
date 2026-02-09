@@ -41,7 +41,7 @@ jobs:
         run: |
           poetry run python main.py
 
-          - name: Upload calibration log
+      - name: Upload calibration log
   uses: actions/upload-artifact@v4
   with:
     name: forecasting-calibration-log
