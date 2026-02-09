@@ -1,4 +1,4 @@
-#main.py
+# main.py
 import argparse
 import asyncio
 import json
@@ -49,9 +49,18 @@ logger = logging.getLogger("ConservativeHybridBot")
 # -----------------------------
 RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "25"))
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "60"))
-EXTREMIZE_THRESHOLD = float(os.getenv("EXTREMIZE_THRESHOLD", "0.60"))  # "Of 60 extremize it"
-EXTREMIZE_ALPHA = float(os.getenv("EXTREMIZE_ALPHA", "1.6"))          # logit scaling strength
-EXTREMIZE_ALPHA_STRONG = float(os.getenv("EXTREMIZE_ALPHA_STRONG", "2.0"))
+
+# Extremization & calibration controls
+EXTREMIZE_THRESHOLD = float(os.getenv("EXTREMIZE_THRESHOLD", "0.60"))     # legacy threshold
+EXTREMIZE_ALPHA = float(os.getenv("EXTREMIZE_ALPHA", "1.35"))            # default gentler alpha (ROI: less overconfidence)
+EXTREMIZE_ALPHA_STRONG = float(os.getenv("EXTREMIZE_ALPHA_STRONG", "1.80"))
+EXTREMIZE_DISPERSION_STD_MAX = float(os.getenv("EXTREMIZE_DISPERSION_STD_MAX", "0.06"))  # extremize only if committee agrees
+
+# Crowd/model shrinkage (ROI: improves calibration)
+CROWD_BLEND_WEAK = float(os.getenv("CROWD_BLEND_WEAK", "0.45"))    # weight on model when evidence weak
+CROWD_BLEND_MIXED = float(os.getenv("CROWD_BLEND_MIXED", "0.65"))
+CROWD_BLEND_STRONG = float(os.getenv("CROWD_BLEND_STRONG", "0.80"))
+
 MIN_P = float(os.getenv("MIN_P", "0.01"))
 MAX_P = float(os.getenv("MAX_P", "0.99"))
 
@@ -91,7 +100,6 @@ def clamp01(p: float) -> float:
 
 
 def sigmoid(x: float) -> float:
-    # stable enough for typical logit inputs here
     return 1.0 / (1.0 + np.exp(-x))
 
 
@@ -106,7 +114,7 @@ def extremize_probability(p: float, alpha: float) -> float:
 
 
 def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
-    """Extremize if p is at least threshold away from 0.5 in either direction (>=0.60 or <=0.40)."""
+    """Legacy: extremize if p >= threshold or p <= 1-threshold."""
     return (p >= threshold) or (p <= (1.0 - threshold))
 
 
@@ -119,11 +127,10 @@ def is_research_sufficient(research_by_source: Dict[str, str]) -> bool:
         if not txt:
             return False
         low = txt.lower()
-        if "failed:" in low or "error:" in low or "timeout" in low:
-            # allow some errors but not all
-            pass
-        # basic length check
-        return len(txt.strip()) > 80
+        # Treat pure failures as bad
+        if ("failed:" in low or "error:" in low or "timeout" in low) and len(txt.strip()) < 200:
+            return False
+        return len(txt.strip()) > 120
 
     return any(good(v) for v in research_by_source.values())
 
@@ -137,7 +144,7 @@ def interpolate_missing_percentiles(reported: list[Percentile], target_percentil
     xs = [p.percentile for p in sorted_rep]
     ys = [p.value for p in sorted_rep]
 
-    interpolated = []
+    interpolated: List[Percentile] = []
     for tp in target_percentiles:
         if tp in xs:
             val = ys[xs.index(tp)]
@@ -152,19 +159,30 @@ def interpolate_missing_percentiles(reported: list[Percentile], target_percentil
                 x0, x1 = xs[i - 1], xs[i]
                 y0, y1 = ys[i - 1], ys[i]
                 val = y0 + (y1 - y0) * (tp - x0) / (x1 - x0) if x1 != x0 else y0
-        interpolated.append(Percentile(percentile=tp, value=val))
+        interpolated.append(Percentile(percentile=tp, value=float(val)))
     return interpolated
 
 
 def enforce_numeric_constraints(percentiles: list[Percentile], question: NumericQuestion) -> list[Percentile]:
     """Enforce bounds and monotonicity."""
-    lower = question.lower_bound if not question.open_lower_bound else -np.inf
-    upper = question.upper_bound if not question.open_upper_bound else np.inf
+    lower = -np.inf if getattr(question, "open_lower_bound", False) else getattr(question, "lower_bound", None)
+    upper = np.inf if getattr(question, "open_upper_bound", False) else getattr(question, "upper_bound", None)
 
-    bounded = []
+    if lower is None:
+        lower = getattr(question, "nominal_lower_bound", None)
+    if upper is None:
+        upper = getattr(question, "nominal_upper_bound", None)
+
+    if lower is None:
+        lower = -np.inf
+    if upper is None:
+        upper = np.inf
+
+    bounded: List[Percentile] = []
     for p in percentiles:
-        val = max(lower, min(upper, p.value))
-        bounded.append(Percentile(percentile=p.percentile, value=val))
+        val = float(p.value)
+        val = max(lower, min(upper, val))
+        bounded.append(Percentile(percentile=float(p.percentile), value=float(val)))
 
     sorted_by_p = sorted(bounded, key=lambda x: x.percentile)
     values = [p.value for p in sorted_by_p]
@@ -172,16 +190,50 @@ def enforce_numeric_constraints(percentiles: list[Percentile], question: Numeric
         if values[i] < values[i - 1]:
             values[i] = values[i - 1]
 
-    return [Percentile(percentile=sorted_by_p[i].percentile, value=values[i]) for i in range(len(values))]
+    return [Percentile(percentile=sorted_by_p[i].percentile, value=float(values[i])) for i in range(len(values))]
+
+
+def derive_numeric_fallback_bounds(question: NumericQuestion, anchor: Optional[float]) -> Tuple[float, float]:
+    """
+    ROI: numeric questions often have open bounds; never default to 0..1.
+    Prefer (closed bounds) > (nominal bounds) > (anchor-based bounds) > wide generic.
+    """
+    lb = getattr(question, "lower_bound", None)
+    ub = getattr(question, "upper_bound", None)
+
+    if lb is None:
+        lb = getattr(question, "nominal_lower_bound", None)
+    if ub is None:
+        ub = getattr(question, "nominal_upper_bound", None)
+
+    open_lb = getattr(question, "open_lower_bound", False)
+    open_ub = getattr(question, "open_upper_bound", False)
+
+    # If bounds are present but open flags are True, still treat as None for clipping range
+    if open_lb:
+        lb = None
+    if open_ub:
+        ub = None
+
+    if lb is not None and ub is not None and ub > lb:
+        return float(lb), float(ub)
+
+    if isinstance(anchor, (int, float)):
+        a = float(anchor)
+        if a > 0:
+            return float(a * 0.25), float(a * 3.0)
+        return float(a - 1.0), float(a + 1.0)
+
+    # last resort: extremely wide, but finite
+    return -1e9, 1e9
 
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
     """Create a single research string with explicit source sections."""
-    blocks = []
+    blocks: List[str] = []
     for src in ["tavily", "newsapi"]:
         if src in research_by_source:
             blocks.append(f"--- SOURCE {src.upper()} ---\n{research_by_source[src]}\n")
-    # include any extras if present
     for src, txt in research_by_source.items():
         if src not in ("tavily", "newsapi"):
             blocks.append(f"--- SOURCE {src.upper()} ---\n{txt}\n")
@@ -260,10 +312,13 @@ def build_comment(
 
 class ConservativeHybridBot(ForecastBot):
     """
-    Conservative forecasting bot, updated to chase high scores:
-    - Research: Tavily + NewsAPI, then GPT-5.2 synthesizes into a tight evidence summary
-    - Binary: applies threshold-based extremization (>= 0.60 or <= 0.40) using logit scaling
-    - No shared-state LLM mutation across concurrent questions
+    High-ROI tournament bot:
+    - Fixes ForecastBot integration: run_research returns str only (prevents ResearchWithPredictions validation error)
+    - Research: Tavily + NewsAPI (publishedAt), synthesized by GPT-5.2
+    - Robust structured outputs: forecasters emit JSON ONLY (prevents "No JSON found" parser failures)
+    - Binary: committee aggregation in logit space + (optional) extremization gated by agreement + evidence
+      and crowd/model shrinkage blending (improves calibration/log score)
+    - Numeric: reliable percentile JSON + sensible fallbacks (never 0..1 for open bounds)
     """
 
     _max_concurrent_questions = 3
@@ -274,13 +329,16 @@ class ConservativeHybridBot(ForecastBot):
             "default": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4.1-mini",
             "summarizer": "openrouter/openai/gpt-5",
-            "researcher": "openrouter/openai/gpt-5.2",  # replaced Perplexity
+            "researcher": "openrouter/openai/gpt-5.2",
         }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
+
+        # Store meta without breaking ForecastBot schema
+        self._research_meta: Dict[str, Dict[str, Any]] = {}
 
     # -----------------------------
     # Multi-Source Research (Tavily + NewsAPI) + GPT-5.2 synthesis
@@ -291,8 +349,7 @@ class ConservativeHybridBot(ForecastBot):
         try:
             response = self.tavily_client.search(query=query, search_depth="advanced")
             results = response.get("results", []) or []
-            # keep compact and relevant
-            lines = []
+            lines: List[str] = []
             for c in results[:6]:
                 content = (c.get("content") or "").strip()
                 url = (c.get("url") or "").strip()
@@ -309,79 +366,113 @@ class ConservativeHybridBot(ForecastBot):
         if not getattr(self.newsapi_client, "api_key", None):
             return ""
         try:
+            # ROI: recency is usually more important than "relevancy" for Metaculus
             articles = self.newsapi_client.get_everything(
                 q=query,
                 language="en",
-                sort_by="relevancy",
-                page_size=6,
+                sort_by="publishedAt",
+                page_size=8,
             )
             arts = (articles or {}).get("articles", []) or []
-            lines = []
+            lines: List[str] = []
             for a in arts[:6]:
                 title = (a.get("title") or "").strip()
                 desc = (a.get("description") or "").strip()
                 url = (a.get("url") or "").strip()
+                published = (a.get("publishedAt") or "").strip()
                 if title or desc:
-                    lines.append(f"- Title: {title}\n  Snippet: {desc or 'N/A'}\n  Source: {url or 'N/A'}")
+                    lines.append(
+                        f"- Title: {title}\n"
+                        f"  Published: {published or 'N/A'}\n"
+                        f"  Snippet: {desc or 'N/A'}\n"
+                        f"  Source: {url or 'N/A'}"
+                    )
             return "\n".join(lines).strip()
         except Exception as e:
             return f"NewsAPI failed: {e}"
 
-    async def run_research(self, question: MetaculusQuestion) -> Tuple[str, Dict[str, str], List[str]]:
-        """
-        Returns:
-          - synthesized_research_text (string for prompt)
-          - raw research_by_source dict
-          - list of searchers used
-        """
+    async def _run_research_impl(self, question: MetaculusQuestion) -> Tuple[str, Dict[str, str], List[str]]:
         async with self._concurrency_limiter:
-            q = getattr(question, "question_text", "")
+            q = getattr(question, "question_text", "") or ""
 
-            # raw research calls (timeboxed)
             tav = await with_timeout(asyncio.to_thread(self.call_tavily, q), RESEARCH_TIMEOUT_S, "tavily")
             nws = await with_timeout(asyncio.to_thread(self.call_newsapi, q), RESEARCH_TIMEOUT_S, "newsapi")
 
             research_by_source = {"tavily": tav, "newsapi": nws}
-            searchers_used = [s for s in ["tavily", "newsapi"] if (research_by_source.get(s) or "").strip()]
+
+            # Only count as "used" if it has meaningful content
+            def meaningful(txt: str) -> bool:
+                if not txt:
+                    return False
+                low = txt.lower()
+                if "failed:" in low or "error:" in low or "timeout" in low:
+                    return False
+                return len(txt.strip()) > 120
+
+            searchers_used = [s for s in ["tavily", "newsapi"] if meaningful(research_by_source.get(s, ""))]
 
             raw_block = format_research_block(research_by_source)
             sufficient = is_research_sufficient(research_by_source)
 
             if not sufficient:
                 synthesized = "(Insufficient recent research found via Tavily/NewsAPI. Relying more on base rates and general knowledge.)"
-                return synthesized + ("\n\n" + raw_block if raw_block else ""), research_by_source, searchers_used
+                return (synthesized + ("\n\n" + raw_block if raw_block else "")).strip(), research_by_source, searchers_used
 
-            # Synthesize with GPT-5.2 into a concise evidence summary with clear claims + uncertainty
             researcher_llm = self.get_llm("researcher", "llm")
             synth_prompt = clean_indents(f"""
             You are an expert research synthesizer for forecasting.
 
-            Task: Summarize the evidence relevant to the question. Be concrete, cautious, and cite which source block
-            (TAVILY vs NEWSAPI) supports each key claim. If evidence is weak or outdated, say so.
+            Task: Summarize evidence relevant to the question. Be concrete, cautious, and include dates when present.
+            Each key fact MUST end with [TAVILY] or [NEWSAPI] or both.
+            If evidence is weak/outdated, say so.
 
             Question: {q}
 
             Raw research:
             {raw_block}
 
-            Output format:
-            - Key facts (bullet list, each bullet ends with [TAVILY] or [NEWSAPI] or both)
-            - What remains uncertain (bullet list)
-            - Most likely drivers going forward (short bullets)
+            Output format (plain text):
+            - Key facts (bullets with dates where possible; end each with [TAVILY]/[NEWSAPI])
+            - What remains uncertain (bullets)
+            - Likely drivers going forward (bullets)
             Keep it under ~2200 characters.
             """).strip()
 
             synthesized = await with_timeout(researcher_llm.invoke(synth_prompt), LLM_TIMEOUT_S, "research_synthesis")
-            synthesized = synthesized.strip()
+            synthesized = (synthesized or "").strip()
+            if not synthesized:
+                synthesized = "(Research synthesis returned empty. Relying more on base rates and general knowledge.)"
             return synthesized, research_by_source, searchers_used
+
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        """
+        ForecastBot expects a STRING research_report.
+        We store meta on self._research_meta keyed by QID for logging.
+        """
+        synthesized, research_by_source, searchers_used = await self._run_research_impl(question)
+        qid = extract_question_id(question)
+        self._research_meta[qid] = {
+            "synthesized": synthesized,
+            "raw": research_by_source,
+            "searchers_used": searchers_used,
+        }
+        # Optional: log type info to debug misclassification
+        logger.info(
+            f"Q{qid} class={type(question).__name__} "
+            f"options={getattr(question,'options',None)} "
+            f"bounds=({getattr(question,'lower_bound',None)},{getattr(question,'upper_bound',None)}) "
+            f"open_bounds=({getattr(question,'open_lower_bound',None)},{getattr(question,'open_upper_bound',None)})"
+        )
+        return synthesized
 
     # -----------------------------
     # Forecasting core (no shared-state mutation)
     # -----------------------------
     async def _single_forecast(self, question, research: str, model_override: str = None):
         """
-        Returns (result, reasoning_text).
-        IMPORTANT: does NOT mutate self._llms.
+        Returns (result, raw_text).
+        IMPORTANT: does NOT mutate shared llm state.
+        Outputs are JSON-only to avoid parser failures (ROI).
         """
         llm = GeneralLlm(model=model_override) if model_override else self.get_llm("default", "llm")
         parser_llm = self.get_llm("parser", "llm")
@@ -389,9 +480,9 @@ class ConservativeHybridBot(ForecastBot):
         base_rate = safe_community_prediction(question)
         if base_rate is not None:
             if isinstance(question, BinaryQuestion):
-                base_rate_str = f"Community prediction (anchor): {base_rate:.1%}"
+                base_rate_str = f"Community prediction (anchor): {base_rate:.3f} (decimal probability)"
             else:
-                base_rate_str = f"Community prediction (anchor): {base_rate:,.4g}"
+                base_rate_str = f"Community prediction (anchor, scalar): {base_rate:,.6g}"
         else:
             base_rate_str = "No reliable community anchor available."
 
@@ -399,8 +490,8 @@ class ConservativeHybridBot(ForecastBot):
 
         if isinstance(question, BinaryQuestion):
             prompt = clean_indents(f"""
-            You are a high-performing tournament forecaster optimizing for log score.
-            Use base rates as anchors, but move decisively when evidence supports it.
+            You are a tournament forecaster optimizing for log score.
+            Use base rates as anchors, but update with evidence.
 
             Question: {question.question_text}
             Background: {question.background_info}
@@ -414,28 +505,23 @@ class ConservativeHybridBot(ForecastBot):
 
             Today (UTC): {today_utc}
 
-            Guidance:
-            - Start from the anchor/base rate when available.
-            - Adjust for time-to-resolution, path dependence, and recent evidence.
-            - Avoid 0% or 100% unless logically impossible/certain.
-            - State the final probability clearly.
-
-            End with exactly: "Probability: ZZ%"
+            Output JSON ONLY. No extra text.
+            Schema: {{"prediction_in_decimal": number}}
+            Constraints:
+            - 0.01 <= prediction_in_decimal <= 0.99
             """).strip()
 
-            reasoning = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "binary_llm")
-            pred: BinaryPrediction = await structure_output(
-                reasoning, BinaryPrediction, model=parser_llm
-            )
-            result = clamp01(pred.prediction_in_decimal)
-            return result, str(reasoning)
+            raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "binary_llm")
+            pred: BinaryPrediction = await structure_output(raw, BinaryPrediction, model=parser_llm)
+            result = clamp01(float(pred.prediction_in_decimal))
+            return result, str(raw)
 
-        elif isinstance(question, MultipleChoiceQuestion):
+        if isinstance(question, MultipleChoiceQuestion):
             prompt = clean_indents(f"""
-            You are a high-performing tournament forecaster optimizing for log score.
+            You are a tournament forecaster optimizing for log score.
 
             Question: {question.question_text}
-            Options (exact): {question.options}
+            Options (exact strings): {question.options}
             Background: {question.background_info}
             Resolution: {question.resolution_criteria}
 
@@ -446,29 +532,40 @@ class ConservativeHybridBot(ForecastBot):
 
             Today (UTC): {today_utc}
 
-            Guidance:
-            - Assign non-zero probability to each option unless impossible.
-            - If uncertain, distribute sensibly (often near-uniform or guided by anchor).
-
-            End with probabilities for each option in order, matching the exact option strings.
+            Output JSON ONLY. No extra text.
+            Schema:
+            {{
+              "predicted_options": [
+                {{"option":"<exact option>","probability": number}},
+                ...
+              ]
+            }}
+            Constraints:
+            - Include ALL options exactly once (match exact strings).
+            - Probabilities sum to 1.
+            - No probability is exactly 0 unless logically impossible.
             """).strip()
 
-            reasoning = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "mc_llm")
+            raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "mc_llm")
             result = await structure_output(
-                reasoning,
+                raw,
                 PredictedOptionList,
                 model=parser_llm,
                 additional_instructions=f"Options must be exactly: {question.options}"
             )
-            return result, str(reasoning)
+            return result, str(raw)
 
-        elif isinstance(question, NumericQuestion):
-            lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {question.lower_bound or question.nominal_lower_bound}"
-            upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {question.upper_bound or question.nominal_upper_bound}"
+        if isinstance(question, NumericQuestion):
+            lower_ref = getattr(question, "lower_bound", None)
+            upper_ref = getattr(question, "upper_bound", None)
+            nlb = getattr(question, "nominal_lower_bound", None)
+            nub = getattr(question, "nominal_upper_bound", None)
+            lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {lower_ref if lower_ref is not None else nlb}"
+            upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {upper_ref if upper_ref is not None else nub}"
 
             prompt = clean_indents(f"""
-            You are a high-performing tournament forecaster optimizing for log score.
-            Provide a calibrated distribution (wide enough to avoid overconfidence).
+            You are a tournament forecaster optimizing for log score.
+            Provide a calibrated distribution (avoid overconfidence).
 
             Question: {question.question_text}
             Units: {question.unit_of_measure or 'Infer from context'}
@@ -484,27 +581,45 @@ class ConservativeHybridBot(ForecastBot):
 
             Today (UTC): {today_utc}
 
-            IMPORTANT:
-            - Use the correct scale/units. If an anchor is given, it is likely in correct units.
-            - Provide percentiles exactly: 10, 20, 40, 60, 80, 90.
+            Output JSON ONLY. No extra text.
+            Schema: a JSON array of objects with keys:
+              - "percentile": one of [0.1,0.2,0.4,0.6,0.8,0.9]
+              - "value": number
+            Constraints:
+            - Values must be non-decreasing with percentile.
+            - Respect bounds if they exist.
             """).strip()
 
-            reasoning = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "num_llm")
-            percentile_list: list[Percentile] = await structure_output(
-                reasoning, list[Percentile], model=parser_llm
-            )
+            raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "num_llm")
+            percentile_list: list[Percentile] = await structure_output(raw, list[Percentile], model=parser_llm)
 
             target_ps = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
             interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
             validated = enforce_numeric_constraints(interpolated, question)
-            result = NumericDistribution.from_question(validated, question)
-            return result, str(reasoning)
 
-        else:
-            raise ValueError(f"Unsupported question type: {type(question)}")
+            # sanity: if everything is identical (degenerate), widen slightly within bounds
+            vals = [p.value for p in validated]
+            if len(set([round(v, 12) for v in vals])) == 1:
+                lb, ub = derive_numeric_fallback_bounds(question, base_rate)
+                mid = float(vals[0])
+                width = (ub - lb) * 0.08 if np.isfinite(ub - lb) else max(1.0, abs(mid) * 0.25)
+                widened = [
+                    Percentile(0.1, mid - 1.2 * width),
+                    Percentile(0.2, mid - 0.7 * width),
+                    Percentile(0.4, mid - 0.2 * width),
+                    Percentile(0.6, mid + 0.2 * width),
+                    Percentile(0.8, mid + 0.7 * width),
+                    Percentile(0.9, mid + 1.2 * width),
+                ]
+                validated = enforce_numeric_constraints(widened, question)
+
+            result = NumericDistribution.from_question(validated, question)
+            return result, str(raw)
+
+        raise ValueError(f"Unsupported question type: {type(question)}")
 
     # -----------------------------
-    # Binary: committee + extremization for high scores
+    # Binary: committee + agreement-gated extremization + crowd shrinkage
     # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         models = [
@@ -513,102 +628,115 @@ class ConservativeHybridBot(ForecastBot):
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
 
+        qid = extract_question_id(question)
         base = safe_community_prediction(question)
         base_rate_text = f"{base:.1%}" if isinstance(base, (int, float)) else "None"
 
-        forecasts: List[float] = []
-        reasonings: List[str] = []
-
-        # Evidence-strength classifier (optional) using GPT-5.2 to decide stronger extremization
-        # This is *not* Perplexity; it's GPT-5.2 on OpenRouter.
+        # evidence strength label (used for blending + extremization)
         evidence_strength: Literal["STRONG", "MIXED", "WEAK"] = "MIXED"
         try:
             researcher_llm = self.get_llm("researcher", "llm")
             strength_prompt = clean_indents(f"""
-            You are a superforecaster judging evidence strength for extremization.
+            Rate evidence strength for this forecast as exactly one token: STRONG, MIXED, or WEAK.
+
+            STRONG: multiple credible signals, little plausible reversal
+            MIXED: some evidence but meaningful uncertainty remains
+            WEAK: thin/noisy/dated evidence
 
             Question: {question.question_text}
             Resolution criteria: {question.resolution_criteria}
 
             Research summary:
             {research}
-
-            Rate evidence strength as one of:
-            - STRONG: multiple credible signals, little plausible reversal
-            - MIXED: some evidence but meaningful uncertainty remains
-            - WEAK: thin/noisy/dated evidence
-
-            Answer with exactly one token: STRONG, MIXED, or WEAK
             """).strip()
             resp = await with_timeout(researcher_llm.invoke(strength_prompt), 30, "evidence_strength")
             resp = (resp or "").strip().upper()
             if resp in ("STRONG", "MIXED", "WEAK"):
                 evidence_strength = resp  # type: ignore
         except Exception as e:
-            logger.debug(f"Evidence strength check failed for Q{extract_question_id(question)}: {e}")
+            logger.debug(f"Evidence strength check failed for Q{qid}: {e}")
 
-        alpha = EXTREMIZE_ALPHA_STRONG if evidence_strength == "STRONG" else EXTREMIZE_ALPHA
+        # Collect committee forecasts
+        raw_ps: List[float] = []
+        model_notes: List[str] = []
 
         for model in models:
             try:
-                pred, reason = await self._single_forecast(question, research, model_override=model)
-                pred = float(pred)
-
-                # "Of 60 extremize it": if |p-0.5| >= 0.10 (i.e., >=0.60 or <=0.40), extremize via logit scaling.
-                pred_before = pred
-                if should_extremize(pred, EXTREMIZE_THRESHOLD):
-                    pred = extremize_probability(pred, alpha=alpha)
-                    tag = f"[EXTREMIZED@{EXTREMIZE_THRESHOLD:.2f}, alpha={alpha:.2f}, {evidence_strength}]"
-                else:
-                    tag = "[NOT EXTREMIZED]"
-
-                forecasts.append(clamp01(pred))
-                reasonings.append(f"{tag} model={model} p0={pred_before:.3f} p={pred:.3f} :: {str(reason)[:1200]}")
-
+                p, raw = await self._single_forecast(question, research, model_override=model)
+                p = float(p)
+                raw_ps.append(clamp01(p))
+                model_notes.append(f"- model={model} p={p:.3f}")
             except Exception as e:
-                logger.warning(f"Model {model} failed on binary Q{extract_question_id(question)}: {e}")
+                logger.warning(f"Model {model} failed on binary Q{qid}: {e}")
                 fallback = clamp01(base if isinstance(base, (int, float)) else 0.5)
-                forecasts.append(fallback)
-                reasonings.append(f"[FALLBACK] model={model} :: {e}")
+                raw_ps.append(fallback)
+                model_notes.append(f"- model={model} FALLBACK p={fallback:.3f} err={e}")
 
-        median_pred = float(np.median(forecasts))
-        median_pred = clamp01(median_pred)
+        # Aggregate in logit space (better behaved)
+        logits = np.array([logit(p) for p in raw_ps], dtype=float)
+        logit_med = float(np.median(logits))
+        p_agg = clamp01(sigmoid(logit_med))
+
+        # Agreement metric
+        p_std = float(np.std(raw_ps))
+        agree = p_std <= EXTREMIZE_DISPERSION_STD_MAX
+
+        # Optional extremization: only if (a) committee agrees AND (b) p is away from 0.5 AND (c) evidence not WEAK
+        alpha = EXTREMIZE_ALPHA_STRONG if evidence_strength == "STRONG" else EXTREMIZE_ALPHA
+        p_final = p_agg
+        did_ext = False
+        if agree and evidence_strength != "WEAK" and should_extremize(p_agg, EXTREMIZE_THRESHOLD):
+            p_final = extremize_probability(p_agg, alpha=alpha)
+            did_ext = True
+
+        # Crowd shrinkage blending (ROI)
+        if isinstance(base, (int, float)):
+            w = CROWD_BLEND_MIXED
+            if evidence_strength == "WEAK":
+                w = CROWD_BLEND_WEAK
+            elif evidence_strength == "STRONG":
+                w = CROWD_BLEND_STRONG
+
+            # also penalize w when models disagree
+            if not agree:
+                w = max(0.35, w - 0.20)
+
+            p_final = clamp01(w * p_final + (1.0 - w) * float(base))
+
+        forecast_text = f"{p_final:.1%}"
+
+        # searchers used from cached meta (more accurate than string matching)
+        meta = self._research_meta.get(qid, {})
+        searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
-        - Ran a 3-model committee and took the median.
-        - Applied threshold-based extremization: if p >= {EXTREMIZE_THRESHOLD:.2f} or p <= {1-EXTREMIZE_THRESHOLD:.2f},
-          transformed p via logit scaling (alpha={alpha:.2f}; evidence={evidence_strength}).
-        - Anchored on community prediction when available, adjusted using research summary.
+        - 3-model committee; aggregated in logit space (median of logits).
+        - Agreement check: std={p_std:.3f} (extremize only if <= {EXTREMIZE_DISPERSION_STD_MAX:.2f}).
+        - Extremization: {'YES' if did_ext else 'NO'} (threshold={EXTREMIZE_THRESHOLD:.2f}, alpha={alpha:.2f}, evidence={evidence_strength}).
+        - Crowd/model blending: {'YES' if isinstance(base,(int,float)) else 'NO'} (evidence={evidence_strength}, agreement={agree}).
         """).strip()
-
-        forecast_text = f"{median_pred:.1%}"
-        searchers_used = []
-        if "--- SOURCE TAVILY ---" in research:
-            searchers_used.append("tavily")
-        if "--- SOURCE NEWSAPI ---" in research:
-            searchers_used.append("newsapi")
 
         comment = build_comment(
             question=question,
             forecast_text=forecast_text,
             base_rate_text=base_rate_text,
-            how_text=how_text + "\n\n" + "### Model notes\n" + "\n".join(f"- {r}" for r in reasonings[:6]),
+            how_text=how_text + "\n\n### Model notes\n" + "\n".join(model_notes[:9]),
             searchers_used=searchers_used,
             models_used=models,
         )
 
         log_forecast_for_calibration(
             question,
-            median_pred,
+            p_final,
             comment,
             models,
             True if searchers_used else False,
             searchers_used,
         )
-        return ReasonedPrediction(prediction_value=median_pred, reasoning=comment)
+        return ReasonedPrediction(prediction_value=p_final, reasoning=comment)
 
     # -----------------------------
-    # Multiple choice: committee median by option key
+    # Multiple choice: committee median by option key + prob floor
     # -----------------------------
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -619,70 +747,68 @@ class ConservativeHybridBot(ForecastBot):
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
 
+        qid = extract_question_id(question)
         base = safe_community_prediction(question)
         base_rate_text = f"{base:,.4g}" if isinstance(base, (int, float)) else "None"
 
         per_model_maps: List[Dict[str, float]] = []
-        reasonings: List[str] = []
+        model_notes: List[str] = []
 
         for model in models:
             try:
-                pred, reason = await self._single_forecast(question, research, model_override=model)
-                # Align by option string
+                pred, raw = await self._single_forecast(question, research, model_override=model)
                 m: Dict[str, float] = {}
                 for item in pred.predicted_options:
                     opt = item["option"]
                     prob = float(item["probability"])
                     m[opt] = max(0.0, prob)
-                # Fill any missing with 0
                 for opt in question.options:
                     m.setdefault(opt, 0.0)
-                # Normalize
+
                 s = sum(m.values())
-                if s > 0:
+                if s <= 0:
+                    n = len(question.options)
+                    m = {opt: 1.0 / n for opt in question.options}
+                else:
                     for k in list(m.keys()):
                         m[k] = float(m[k] / s)
-                else:
-                    n = len(question.options)
-                    for opt in question.options:
-                        m[opt] = 1.0 / n
+
                 per_model_maps.append(m)
-                reasonings.append(f"model={model} :: {str(reason)[:1200]}")
+                model_notes.append(f"- model={model} ok")
             except Exception as e:
-                logger.warning(f"Model {model} failed on MC Q{extract_question_id(question)}: {e}")
+                logger.warning(f"Model {model} failed on MC Q{qid}: {e}")
                 n = len(question.options)
                 per_model_maps.append({opt: 1.0 / n for opt in question.options})
-                reasonings.append(f"[FALLBACK] model={model} :: {e}")
+                model_notes.append(f"- model={model} FALLBACK err={e}")
 
-        # Median by option key
         option_list = list(question.options)
         mat = np.array([[m[opt] for opt in option_list] for m in per_model_maps], dtype=float)
         med = np.median(mat, axis=0)
-        med = med / med.sum() if med.sum() > 0 else np.full_like(med, 1.0 / len(med))
+
+        # ROI: small probability floor to reduce catastrophic log loss when surprised
+        n = len(option_list)
+        floor = max(1e-6, 0.01 / n)
+        med = np.maximum(med, floor)
+        med = med / med.sum()
 
         median_forecast = PredictedOptionList([
             {"option": opt, "probability": float(p)} for opt, p in zip(option_list, med)
         ])
-
         forecast_text = ", ".join([f"{o['option']}: {o['probability']:.1%}" for o in median_forecast.predicted_options])
 
-        searchers_used = []
-        if "--- SOURCE TAVILY ---" in research:
-            searchers_used.append("tavily")
-        if "--- SOURCE NEWSAPI ---" in research:
-            searchers_used.append("newsapi")
+        meta = self._research_meta.get(qid, {})
+        searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
-        - Ran a 3-model committee and took the median probability per option.
-        - Normalized the final distribution to sum to 1.
-        - Used research summary (if available) + community anchor (if available).
+        - 3-model committee; median probability per option.
+        - Applied probability floor={floor:.6f} then renormalized.
         """).strip()
 
         comment = build_comment(
             question=question,
             forecast_text=forecast_text,
             base_rate_text=base_rate_text,
-            how_text=how_text + "\n\n" + "### Model notes\n" + "\n".join(f"- {r}" for r in reasonings[:6]),
+            how_text=how_text + "\n\n### Model notes\n" + "\n".join(model_notes[:9]),
             searchers_used=searchers_used,
             models_used=models,
         )
@@ -698,7 +824,7 @@ class ConservativeHybridBot(ForecastBot):
         return ReasonedPrediction(prediction_value=median_forecast, reasoning=comment)
 
     # -----------------------------
-    # Numeric: committee median per percentile after per-model normalization
+    # Numeric: committee median per percentile + safe fallbacks
     # -----------------------------
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -709,34 +835,32 @@ class ConservativeHybridBot(ForecastBot):
             "openrouter/anthropic/claude-sonnet-4.5",
         ]
 
+        qid = extract_question_id(question)
         base = safe_community_prediction(question)
         base_rate_text = f"{base:,.4g}" if isinstance(base, (int, float)) else "None"
 
         target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
         per_model_percentiles: List[List[Percentile]] = []
-        reasonings: List[str] = []
+        model_notes: List[str] = []
 
         for model in models:
             try:
-                dist, reason = await self._single_forecast(question, research, model_override=model)
-                # Normalize each model output onto the target percentile set
+                dist, raw = await self._single_forecast(question, research, model_override=model)
                 declared = list(getattr(dist, "declared_percentiles", [])) or []
                 interpolated = interpolate_missing_percentiles(declared, target_percentiles)
                 validated = enforce_numeric_constraints(interpolated, question)
                 per_model_percentiles.append(validated)
-                reasonings.append(f"model={model} :: {str(reason)[:1200]}")
+                model_notes.append(f"- model={model} ok")
             except Exception as e:
-                logger.warning(f"Model {model} failed on numeric Q{extract_question_id(question)}: {e}")
-                # Fallback distribution centered around anchor or mid-bounds
-                lower_b = question.lower_bound if question.lower_bound is not None else 0.0
-                upper_b = question.upper_bound if question.upper_bound is not None else 1.0
+                logger.warning(f"Model {model} failed on numeric Q{qid}: {e}")
 
+                lb, ub = derive_numeric_fallback_bounds(question, base)
                 if isinstance(base, (int, float)):
                     center = float(base)
-                    width = (upper_b - lower_b) * 0.25
+                    width = (ub - lb) * 0.25
                 else:
-                    center = (lower_b + upper_b) / 2.0
-                    width = (upper_b - lower_b) * 0.35
+                    center = (lb + ub) / 2.0
+                    width = (ub - lb) * 0.35
 
                 fallback_vals = [
                     center - width * 0.9,
@@ -746,12 +870,11 @@ class ConservativeHybridBot(ForecastBot):
                     center + width * 0.5,
                     center + width * 0.9,
                 ]
-                fallback_vals = [max(lower_b, min(upper_b, v)) for v in fallback_vals]
-                fallback_ps = [
-                    Percentile(percentile=p, value=v) for p, v in zip(target_percentiles, fallback_vals)
-                ]
+                # clip to bounds
+                fallback_vals = [max(lb, min(ub, v)) for v in fallback_vals]
+                fallback_ps = [Percentile(percentile=p, value=v) for p, v in zip(target_percentiles, fallback_vals)]
                 per_model_percentiles.append(enforce_numeric_constraints(fallback_ps, question))
-                reasonings.append(f"[FALLBACK] model={model} :: {e}")
+                model_notes.append(f"- model={model} FALLBACK bounds=({lb:.3g},{ub:.3g}) err={e}")
 
         # Median per percentile
         aggregated: List[Percentile] = []
@@ -762,27 +885,23 @@ class ConservativeHybridBot(ForecastBot):
         validated = enforce_numeric_constraints(aggregated, question)
         distribution = NumericDistribution.from_question(validated, question)
 
-        forecast_text = ", ".join([f"p{int(p.percentile*100)}={p.value:,.4g}" for p in validated])
+        forecast_text = ", ".join([f"p{int(p.percentile*100)}={p.value:,.6g}" for p in validated])
 
-        searchers_used = []
-        if "--- SOURCE TAVILY ---" in research:
-            searchers_used.append("tavily")
-        if "--- SOURCE NEWSAPI ---" in research:
-            searchers_used.append("newsapi")
+        meta = self._research_meta.get(qid, {})
+        searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
         how_text = clean_indents(f"""
-        - Ran a 3-model committee.
-        - For each model, forced percentiles onto {', '.join(str(int(p*100)) for p in target_percentiles)} via interpolation,
-          then enforced bounds + monotonicity.
-        - Took the median value per percentile and re-validated constraints.
-        - Used research summary (if available) + community anchor (if available).
+        - 3-model committee.
+        - Forced percentiles onto {', '.join(str(int(p*100)) for p in target_percentiles)} via interpolation,
+          enforced bounds + monotonicity, then took median value per percentile.
+        - Numeric fallbacks never assume 0..1; they derive bounds from question/nominals/anchor.
         """).strip()
 
         comment = build_comment(
             question=question,
             forecast_text=forecast_text,
             base_rate_text=base_rate_text,
-            how_text=how_text + "\n\n" + "### Model notes\n" + "\n".join(f"- {r}" for r in reasonings[:6]),
+            how_text=how_text + "\n\n### Model notes\n" + "\n".join(model_notes[:9]),
             searchers_used=searchers_used,
             models_used=models,
         )
@@ -822,15 +941,6 @@ if __name__ == "__main__":
         all_reports = []
         for tid in args.tournament_ids:
             logger.info(f"Forecasting on tournament: {tid}")
-
-            # NOTE: ForecastBot will call run_research() internally if configured that way.
-            # If your ForecastBot expects overridden run_research to return a string only,
-            # adjust ForecastBot integration accordingly. If it calls run_research and uses its return
-            # as "research", then change run_research to return just the synthesized text.
-            #
-            # If ForecastBot calls run_research(question) expecting a str, we can shim by overriding
-            # ForecastBot hooks elsewhere. If needed, modify run_research to return only synthesized text.
-
             reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
             all_reports.extend(reports)
 
