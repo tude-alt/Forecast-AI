@@ -1,4 +1,3 @@
-# tude.py
 import argparse
 import asyncio
 import json
@@ -15,7 +14,7 @@ from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
-    MetaculusClient,  # ✅ FIX: use the newer client (avoids legacy bound assertions)
+    MetaculusClient,
     MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericDistribution,
@@ -31,73 +30,46 @@ from forecasting_tools import (
 from tavily import TavilyClient
 from newsapi import NewsApiClient
 
-# -----------------------------
-# Environment & API Keys
-# -----------------------------
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
 
-# -----------------------------
-# Logging setup
-# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("Tude")
 
-# -----------------------------
-# Timeouts & Limits
-# -----------------------------
 RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "25"))
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "70"))
 
-# Rate limiting / publish pacing (HIGH ROI vs Cloudflare 1015)
-MAX_CONCURRENT_QUESTIONS = int(os.getenv("MAX_CONCURRENT_QUESTIONS", "1"))  # set to 1 to avoid 1015
-PUBLISH_SLEEP_S = float(os.getenv("PUBLISH_SLEEP_S", "3.0"))               # pause between forecast submissions
-TOURNAMENT_SLEEP_S = float(os.getenv("TOURNAMENT_SLEEP_S", "8.0"))         # pause between tournaments
+MAX_CONCURRENT_QUESTIONS = int(os.getenv("MAX_CONCURRENT_QUESTIONS", "1"))
+PUBLISH_SLEEP_S = float(os.getenv("PUBLISH_SLEEP_S", "3.0"))
+TOURNAMENT_SLEEP_S = float(os.getenv("TOURNAMENT_SLEEP_S", "8.0"))
 RETRY_MAX = int(os.getenv("RETRY_MAX", "6"))
 RETRY_BASE_S = float(os.getenv("RETRY_BASE_S", "2.0"))
 RETRY_MAX_S = float(os.getenv("RETRY_MAX_S", "60.0"))
 
-# Extremization & calibration controls
 EXTREMIZE_THRESHOLD = float(os.getenv("EXTREMIZE_THRESHOLD", "0.60"))
 EXTREMIZE_ALPHA = float(os.getenv("EXTREMIZE_ALPHA", "1.35"))
-EXTREMIZE_ALPHA_STRONG = float(os.getenv("EXTREMIZE_ALPHA_STRONG", "1.80"))
 EXTREMIZE_DISPERSION_STD_MAX = float(os.getenv("EXTREMIZE_DISPERSION_STD_MAX", "0.06"))
 
-# Crowd/model shrinkage
 CROWD_BLEND_WEAK = float(os.getenv("CROWD_BLEND_WEAK", "0.45"))
 CROWD_BLEND_MIXED = float(os.getenv("CROWD_BLEND_MIXED", "0.65"))
-CROWD_BLEND_STRONG = float(os.getenv("CROWD_BLEND_STRONG", "0.80"))
 
 MIN_P = float(os.getenv("MIN_P", "0.01"))
 MAX_P = float(os.getenv("MAX_P", "0.99"))
 
-# Never forecast without research
 REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true", "yes")
-
-# Calibration logging helper
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def extract_question_id(question: MetaculusQuestion) -> str:
-    """
-    Fix Qunknown:
-    - Prefer question.id if available
-    - Else parse /questions/<digits> from URL
-    - Else parse /questions/<digits>/ from any stringified URL-like fields
-    """
     try:
         qid = getattr(question, "id", None)
         if isinstance(qid, (int, str)) and str(qid).isdigit():
             return str(qid)
     except Exception:
         pass
-
     try:
         url = str(getattr(question, "url", "") or "")
         m = re.search(r"/questions/(\d+)(?:/|$)", url)
@@ -105,7 +77,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
             return m.group(1)
     except Exception:
         pass
-
     try:
         s = str(question)
         m = re.search(r"/questions/(\d+)(?:/|$)", s)
@@ -113,7 +84,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
             return m.group(1)
     except Exception:
         pass
-
     return "unknown"
 
 
@@ -167,11 +137,9 @@ def is_research_sufficient(research_by_source: Dict[str, str]) -> bool:
 def interpolate_missing_percentiles(reported: list[Percentile], target_percentiles: list[float]) -> list[Percentile]:
     if not reported:
         return [Percentile(percentile=p, value=0.0) for p in target_percentiles]
-
     sorted_rep = sorted(reported, key=lambda x: x.percentile)
     xs = [float(p.percentile) for p in sorted_rep]
     ys = [float(p.value) for p in sorted_rep]
-
     out: List[Percentile] = []
     for tp in target_percentiles:
         if tp in xs:
@@ -191,17 +159,14 @@ def interpolate_missing_percentiles(reported: list[Percentile], target_percentil
     return out
 
 
-# ✅ FIX: Safe numeric bounds (no ±1e9 fallback; avoid non-finite ranges)
-def derive_numeric_fallback_bounds(question: NumericQuestion, anchor: Optional[float]) -> Tuple[float, float]:
-    """
-    Safe fallback bounds that stay finite and reasonable.
+def _finite(x) -> bool:
+    try:
+        return x is not None and np.isfinite(float(x))
+    except Exception:
+        return False
 
-    Priority:
-      1) Use (lower_bound, upper_bound) if finite and ordered and not open.
-      2) Else use nominal bounds if available and finite and ordered.
-      3) Else build a symmetric band around anchor (finite).
-      4) Else fallback to (0, 1).
-    """
+
+def _safe_lb_ub(question: NumericQuestion) -> Tuple[float, float]:
     lb = getattr(question, "lower_bound", None)
     ub = getattr(question, "upper_bound", None)
 
@@ -210,46 +175,75 @@ def derive_numeric_fallback_bounds(question: NumericQuestion, anchor: Optional[f
     if getattr(question, "open_upper_bound", False):
         ub = None
 
-    def finite(x) -> bool:
-        try:
-            return x is not None and np.isfinite(float(x))
-        except Exception:
-            return False
+    if not _finite(lb):
+        lb = getattr(question, "nominal_lower_bound", None)
+    if not _finite(ub):
+        ub = getattr(question, "nominal_upper_bound", None)
 
-    if finite(lb) and finite(ub) and float(ub) > float(lb):
+    if _finite(lb) and _finite(ub) and float(ub) > float(lb):
         return float(lb), float(ub)
 
-    nlb = getattr(question, "nominal_lower_bound", None)
-    nub = getattr(question, "nominal_upper_bound", None)
-    if finite(nlb) and finite(nub) and float(nub) > float(nlb):
-        return float(nlb), float(nub)
-
-    if isinstance(anchor, (int, float)) and np.isfinite(float(anchor)):
-        a = float(anchor)
-        span = max(abs(a) * 0.5, 1.0)
-        # keep a conservative cap on span in case anchor is absurdly large
-        span = min(span, 1e12)
-        return a - span, a + span
+    if _finite(lb) and not _finite(ub):
+        return float(lb), float(lb) + max(1.0, abs(float(lb)) * 0.5)
+    if _finite(ub) and not _finite(lb):
+        return float(ub) - max(1.0, abs(float(ub)) * 0.5), float(ub)
 
     return 0.0, 1.0
 
 
 def enforce_numeric_constraints(percentiles: list[Percentile], question: NumericQuestion) -> list[Percentile]:
-    # Prefer explicit bounds if finite, else safe fallback
-    lb, ub = derive_numeric_fallback_bounds(question, None)
+    lb, ub = _safe_lb_ub(question)
 
-    bounded = []
+    bounded: List[Percentile] = []
     for p in percentiles:
         v = float(p.value)
+        if not np.isfinite(v):
+            v = lb
         v = max(lb, min(ub, v))
         bounded.append(Percentile(percentile=float(p.percentile), value=float(v)))
 
-    srt = sorted(bounded, key=lambda x: x.percentile)
-    vals = [p.value for p in srt]
-    for i in range(1, len(vals)):
-        if vals[i] < vals[i - 1]:
-            vals[i] = vals[i - 1]
-    return [Percentile(percentile=srt[i].percentile, value=float(vals[i])) for i in range(len(vals))]
+    srt = sorted(bounded, key=lambda x: float(x.percentile))
+    for i in range(1, len(srt)):
+        if srt[i].value < srt[i - 1].value:
+            srt[i].value = srt[i - 1].value
+
+    if len(srt) >= 2 and srt[-1].value > ub:
+        srt[-1].value = ub
+    if len(srt) >= 2 and srt[0].value < lb:
+        srt[0].value = lb
+
+    return [Percentile(percentile=float(p.percentile), value=float(p.value)) for p in srt]
+
+
+def derive_numeric_fallback_percentiles(question: NumericQuestion, anchor: Optional[float]) -> List[Percentile]:
+    lb, ub = _safe_lb_ub(question)
+    if not np.isfinite(ub - lb) or ub <= lb:
+        lb, ub = 0.0, 1.0
+
+    if isinstance(anchor, (int, float)) and np.isfinite(float(anchor)):
+        a = float(anchor)
+        if a < lb:
+            a = lb + 0.35 * (ub - lb)
+        elif a > ub:
+            a = lb + 0.65 * (ub - lb)
+        center = a
+    else:
+        center = lb + 0.5 * (ub - lb)
+
+    span = max(1e-6, (ub - lb))
+    w = 0.18 * span
+    vals = [
+        max(lb, min(ub, center - 1.2 * w)),
+        max(lb, min(ub, center - 0.7 * w)),
+        max(lb, min(ub, center - 0.2 * w)),
+        max(lb, min(ub, center + 0.2 * w)),
+        max(lb, min(ub, center + 0.7 * w)),
+        max(lb, min(ub, center + 1.2 * w)),
+    ]
+    pcts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+    out = [Percentile(percentile=p, value=v) for p, v in zip(pcts, vals)]
+    out = enforce_numeric_constraints(out, question)
+    return out
 
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
@@ -335,15 +329,11 @@ def build_comment(
     """).strip()
 
 
-# -----------------------------
-# Bot: TUDE
-# -----------------------------
 class Tude(ForecastBot):
     _max_concurrent_questions = MAX_CONCURRENT_QUESTIONS
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def _llm_config_defaults(self) -> dict[str, str]:
-        # Keep your original fix: include 'summarizer'
         return {
             "default": "openrouter/openai/gpt-5.2",
             "parser": "openrouter/openai/gpt-4.1-mini",
@@ -357,9 +347,6 @@ class Tude(ForecastBot):
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
-    # -----------------------------
-    # Research
-    # -----------------------------
     def call_tavily(self, query: str) -> str:
         if not getattr(self.tavily_client, "api_key", None):
             return ""
@@ -500,9 +487,6 @@ class Tude(ForecastBot):
         )
         return synthesized
 
-    # -----------------------------
-    # Forecasting core (JSON-only)
-    # -----------------------------
     async def _single_forecast(self, question, research: str, model_override: str = None):
         if REQUIRE_RESEARCH and (not research or len(research.strip()) < 80):
             raise RuntimeError(f"Missing/insufficient research for Q{extract_question_id(question)}; refusing to forecast.")
@@ -609,35 +593,24 @@ class Tude(ForecastBot):
             """).strip()
 
             raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "num_llm")
-            percentile_list: list[Percentile] = await structure_output(raw, list[Percentile], model=parser_llm)
+            try:
+                percentile_list: list[Percentile] = await structure_output(raw, list[Percentile], model=parser_llm)
+                target_ps = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+                interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
+                validated = enforce_numeric_constraints(interpolated, question)
 
-            target_ps = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-            interpolated = interpolate_missing_percentiles(percentile_list, target_ps)
-            validated = enforce_numeric_constraints(interpolated, question)
+                vals = [p.value for p in validated]
+                if len(set([round(v, 12) for v in vals])) == 1:
+                    validated = derive_numeric_fallback_percentiles(question, base_rate)
 
-            vals = [p.value for p in validated]
-            if len(set([round(v, 12) for v in vals])) == 1:
-                lb, ub = derive_numeric_fallback_bounds(question, base_rate)
-                mid = float(vals[0])
-                span = float(ub - lb) if np.isfinite(ub - lb) and (ub > lb) else max(1.0, abs(mid) * 0.25)
-                width = max(1e-6, span * 0.08)
-                widened = [
-                    Percentile(0.1, mid - 1.2 * width),
-                    Percentile(0.2, mid - 0.7 * width),
-                    Percentile(0.4, mid - 0.2 * width),
-                    Percentile(0.6, mid + 0.2 * width),
-                    Percentile(0.8, mid + 0.7 * width),
-                    Percentile(0.9, mid + 1.2 * width),
-                ]
-                validated = enforce_numeric_constraints(widened, question)
+            except Exception:
+                validated = derive_numeric_fallback_percentiles(question, base_rate)
 
-            return NumericDistribution.from_question(validated, question), str(raw)
+            dist = NumericDistribution.from_question(validated, question)
+            return dist, str(raw)
 
         raise ValueError(f"Unsupported question type: {type(question)}")
 
-    # -----------------------------
-    # Committees + extremization
-    # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         models = [
             "openrouter/openai/gpt-5.2",
@@ -695,7 +668,6 @@ class Tude(ForecastBot):
         qid = extract_question_id(question)
 
         per_model_maps: List[Dict[str, float]] = []
-
         for model in models:
             try:
                 pred, _ = await self._single_forecast(question, research, model_override=model)
@@ -733,7 +705,14 @@ class Tude(ForecastBot):
             searchers_used=searchers_used,
             models_used=models,
         )
-        log_forecast_for_calibration(question, [x["probability"] for x in out.predicted_options], comment, models, True, searchers_used)
+        log_forecast_for_calibration(
+            question,
+            [x["probability"] for x in out.predicted_options],
+            comment,
+            models,
+            True,
+            searchers_used,
+        )
         return ReasonedPrediction(prediction_value=out, reasoning=comment)
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
@@ -755,20 +734,11 @@ class Tude(ForecastBot):
                 declared = list(getattr(dist, "declared_percentiles", [])) or []
                 interpolated = interpolate_missing_percentiles(declared, target_ps)
                 validated = enforce_numeric_constraints(interpolated, question)
+                if not validated or len(validated) != 6:
+                    validated = derive_numeric_fallback_percentiles(question, base)
                 per_model_percentiles.append(validated)
             except Exception as e:
-                lb, ub = derive_numeric_fallback_bounds(question, base)
-                center = float(base) if isinstance(base, (int, float)) and np.isfinite(float(base)) else (lb + ub) / 2.0
-                span = max(1e-6, float(ub - lb)) if np.isfinite(ub - lb) and ub > lb else max(1.0, abs(center) * 0.5)
-                width = span * 0.30
-                vals = [
-                    center - 0.9 * width, center - 0.5 * width, center - 0.15 * width,
-                    center + 0.15 * width, center + 0.5 * width, center + 0.9 * width
-                ]
-                vals = [max(lb, min(ub, v)) for v in vals]
-                per_model_percentiles.append(enforce_numeric_constraints(
-                    [Percentile(p, v) for p, v in zip(target_ps, vals)], question
-                ))
+                per_model_percentiles.append(derive_numeric_fallback_percentiles(question, base))
                 logger.warning(f"Numeric model fallback Q{qid} model={model}: {e}")
 
         aggregated: List[Percentile] = []
@@ -776,6 +746,9 @@ class Tude(ForecastBot):
             aggregated.append(Percentile(p, float(np.median([pm[i].value for pm in per_model_percentiles]))))
 
         validated = enforce_numeric_constraints(aggregated, question)
+        if not validated or len(validated) != 6:
+            validated = derive_numeric_fallback_percentiles(question, base)
+
         dist = NumericDistribution.from_question(validated, question)
 
         meta = self._research_meta.get(qid, {})
@@ -793,11 +766,8 @@ class Tude(ForecastBot):
         return ReasonedPrediction(prediction_value=dist, reasoning=comment)
 
 
-# -----------------------------
-# Entrypoint — Tournament Only
-# -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run TUDE (committee + extremization).")
+    parser = argparse.ArgumentParser(description="Run Tude.")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
@@ -806,7 +776,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # ✅ FIX: Use MetaculusClient constants instead of MetaculusApi (legacy)
     client = MetaculusClient()
     default_ids = [
         "32916",
