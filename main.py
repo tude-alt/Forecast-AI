@@ -27,11 +27,21 @@ from forecasting_tools import (
     structure_output,
 )
 
+# Use Tavily for semantic search
 from tavily import TavilyClient
-from newsapi import NewsApiClient
+
+# TinyFish is used as a live web automation API for surfacing recent news.  The
+# TinyFish API does not have a dedicated news endpoint, but we can instruct an
+# agent to search for recent articles and return structured results.  See the
+# documentation example in TinyFish's Quick Start, which shows how to issue a
+# request via `POST https://agent.tinyfish.ai/v1/automation/run-sse` with a
+# `goal` describing the desired extraction【450391332860218†L107-L126】.
+import requests
+import urllib.parse
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
+TINYFISH_API_KEY = os.getenv("TINYFISH_API_KEY")
+NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")  # retained for backward compatibility
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +74,7 @@ CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 
 def extract_question_id(question: MetaculusQuestion) -> str:
+    """Extract a numeric question identifier from various attributes of a question."""
     try:
         qid = getattr(question, "id", None)
         if isinstance(qid, (int, str)) and str(qid).isdigit():
@@ -88,6 +99,7 @@ def extract_question_id(question: MetaculusQuestion) -> str:
 
 
 def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
+    """Get the community prediction from a Metaculus question if available."""
     try:
         pred = getattr(question, "community_prediction", None)
         if pred is not None and isinstance(pred, (int, float)):
@@ -122,6 +134,7 @@ def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
 
 
 def is_meaningful_research_text(txt: str) -> bool:
+    """Heuristically decide if a research string contains meaningful content."""
     if not txt:
         return False
     low = txt.lower()
@@ -247,8 +260,10 @@ def derive_numeric_fallback_percentiles(question: NumericQuestion, anchor: Optio
 
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
+    """Format the raw research by source into a single text block for summarization."""
     blocks: List[str] = []
-    for src in ["tavily", "newsapi"]:
+    # Only include sources that actually returned data.  Iterate in a stable order.
+    for src in ["tavily", "tinyfish"]:
         txt = (research_by_source or {}).get(src, "") or ""
         if txt.strip():
             blocks.append(f"--- SOURCE {src.upper()} ---\n{txt}\n")
@@ -263,6 +278,7 @@ def log_forecast_for_calibration(
     research_used: bool,
     searchers_used: list[str],
 ):
+    """Record a calibration entry so the bot can be assessed over time."""
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "question_id": extract_question_id(question),
@@ -284,6 +300,7 @@ def log_forecast_for_calibration(
 
 
 async def with_timeout(coro, seconds: float, label: str) -> str:
+    """Run a coroutine with a timeout and return a human-readable status on failure."""
     try:
         return await asyncio.wait_for(coro, timeout=seconds)
     except asyncio.TimeoutError:
@@ -330,6 +347,11 @@ def build_comment(
 
 
 class Tude(ForecastBot):
+    """
+    Tude is a Metaculus forecasting bot that uses research from Tavily and TinyFish
+    to update base rates using Good Judgment style heuristics.  It aggregates
+    predictions from multiple language models to provide calibrated estimates.
+    """
     _max_concurrent_questions = MAX_CONCURRENT_QUESTIONS
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -344,9 +366,74 @@ class Tude(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
+        # Save TinyFish API key for later use.  If not provided, the research
+        # pipeline will silently skip TinyFish.
+        self.tinyfish_api_key = TINYFISH_API_KEY
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
+    # TinyFish integration ---------------------------------------------------
+    def call_tinyfish(self, query: str) -> str:
+        """
+        Use TinyFish's automation API to search for recent news articles related to a
+        query and return a formatted string of bullet points.  The function
+        constructs a natural-language goal to instruct the agent to pull top
+        articles from a news site and extract title, snippet, date and link.  If
+        no API key is configured or an error occurs, an empty string or
+        descriptive error is returned.
+        """
+        if not self.tinyfish_api_key:
+            return ""
+        try:
+            # Use Google News as a starting page for searching the query.  We rely
+            # on TinyFish to navigate and extract relevant articles according to
+            # the goal.  To avoid injection, make sure the query is quoted.
+            encoded_query = query.replace("\n", " ").strip()
+            goal = (
+                f"Find the top 5 recent news articles about \"{encoded_query}\". "
+                "Return JSON with an 'articles' array where each item has keys: title, "
+                "published, snippet, and url."
+            )
+            payload = {
+                "url": "https://news.google.com",
+                "goal": goal,
+            }
+            headers = {
+                "X-API-Key": self.tinyfish_api_key,
+                "Content-Type": "application/json",
+            }
+            # Prefer the synchronous endpoint for simplicity.  TinyFish also
+            # supports streaming (run-sse) but we do not need streaming here.
+            resp = requests.post(
+                "https://agent.tinyfish.ai/v1/automation/run",
+                json=payload,
+                headers=headers,
+                timeout=20,
+            )
+            if not resp.ok:
+                return f"TinyFish API error: {resp.status_code}"
+            data = resp.json() if resp.content else {}
+            result = data.get("resultJson") or data.get("result") or {}
+            articles = result.get("articles") or result.get("results") or []
+            lines: List[str] = []
+            for a in articles[:6]:
+                if not isinstance(a, dict):
+                    continue
+                title = (a.get("title") or "").strip()
+                desc = (a.get("snippet") or a.get("description") or "").strip()
+                url = (a.get("url") or "").strip()
+                published = (a.get("published") or a.get("date") or "").strip()
+                if title or desc:
+                    lines.append(
+                        f"- Title: {title}\n"
+                        f"  Published: {published or 'N/A'}\n"
+                        f"  Snippet: {desc or 'N/A'}\n"
+                        f"  Source: {url or 'N/A'}"
+                    )
+            return "\n".join(lines).strip()
+        except Exception as e:
+            return f"TinyFish API failed: {e}"
+
+    # Tavily wrapper ---------------------------------------------------------
     def call_tavily(self, query: str) -> str:
         if not getattr(self.tavily_client, "api_key", None):
             return ""
@@ -362,34 +449,6 @@ class Tude(ForecastBot):
             return "\n".join(lines).strip()
         except Exception as e:
             return f"Tavily failed: {e}"
-
-    def call_newsapi(self, query: str) -> str:
-        if not getattr(self.newsapi_client, "api_key", None):
-            return ""
-        try:
-            articles = self.newsapi_client.get_everything(
-                q=query,
-                language="en",
-                sort_by="publishedAt",
-                page_size=10,
-            )
-            arts = (articles or {}).get("articles", []) or []
-            lines: List[str] = []
-            for a in arts[:6]:
-                title = (a.get("title") or "").strip()
-                desc = (a.get("description") or "").strip()
-                url = (a.get("url") or "").strip()
-                published = (a.get("publishedAt") or "").strip()
-                if title or desc:
-                    lines.append(
-                        f"- Title: {title}\n"
-                        f"  Published: {published or 'N/A'}\n"
-                        f"  Snippet: {desc or 'N/A'}\n"
-                        f"  Source: {url or 'N/A'}"
-                    )
-            return "\n".join(lines).strip()
-        except Exception as e:
-            return f"NewsAPI failed: {e}"
 
     async def _expand_queries_with_gpt52(self, question_text: str) -> List[str]:
         researcher_llm = self.get_llm("researcher", "llm")
@@ -425,22 +484,24 @@ class Tude(ForecastBot):
             expanded_queries = await self._expand_queries_with_gpt52(qtxt)
 
             tav_parts: List[str] = []
-            nws_parts: List[str] = []
+            tni_parts: List[str] = []
 
+            # Query both Tavily and TinyFish on the first few expanded queries.  Use
+            # timeouts to prevent hanging.
             for i, q in enumerate(expanded_queries[:3]):
                 tav = await with_timeout(asyncio.to_thread(self.call_tavily, q), RESEARCH_TIMEOUT_S, f"tavily_{i}")
                 if is_meaningful_research_text(tav):
                     tav_parts.append(f"## Query: {q}\n{tav}")
 
-                nws = await with_timeout(asyncio.to_thread(self.call_newsapi, q), RESEARCH_TIMEOUT_S, f"newsapi_{i}")
-                if is_meaningful_research_text(nws):
-                    nws_parts.append(f"## Query: {q}\n{nws}")
+                tni = await with_timeout(asyncio.to_thread(self.call_tinyfish, q), RESEARCH_TIMEOUT_S, f"tinyfish_{i}")
+                if is_meaningful_research_text(tni):
+                    tni_parts.append(f"## Query: {q}\n{tni}")
 
             tav_all = "\n\n".join(tav_parts).strip()
-            nws_all = "\n\n".join(nws_parts).strip()
+            tni_all = "\n\n".join(tni_parts).strip()
 
-            research_by_source = {"tavily": tav_all, "newsapi": nws_all}
-            searchers_used = [s for s in ["tavily", "newsapi"] if is_meaningful_research_text(research_by_source.get(s, ""))]
+            research_by_source = {"tavily": tav_all, "tinyfish": tni_all}
+            searchers_used = [s for s in ["tavily", "tinyfish"] if is_meaningful_research_text(research_by_source.get(s, ""))]
 
             if REQUIRE_RESEARCH and not is_research_sufficient(research_by_source):
                 raise RuntimeError(f"Insufficient research for Q{extract_question_id(question)}; refusing to forecast.")
@@ -451,7 +512,7 @@ class Tude(ForecastBot):
             synth_prompt = clean_indents(f"""
             Summarize evidence for forecasting.
             - Prioritize RECENT items; include dates when present.
-            - Each fact ends with [TAVILY] or [NEWSAPI] or both.
+            - Each fact ends with [TAVILY] or [TINYFISH] or both.
             - Include a short "Signposts" section (what to watch).
 
             Question: {qtxt}
@@ -777,12 +838,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     client = MetaculusClient()
-    default_ids = [
+    # Include the Metaculus cup competitions along with minibench.  Duplicate
+    # entries are harmless, but we de-duplicate for clarity.
+    default_ids = list(dict.fromkeys([
         "32916",
         "minibench",
         "market-pulse-26q1",
         getattr(client, "CURRENT_MINIBENCH_ID", "minibench"),
-    ]
+    ]))
     tournament_ids = args.tournament_ids or default_ids
 
     bot = Tude(
