@@ -3,7 +3,7 @@ name: predict AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "*/40 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
 concurrency:
   group: ${{ github.workflow }}
@@ -35,7 +35,7 @@ jobs:
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          TINYFISH_API_KEY: ${{ secrets.TINYFISH_API_KEY }}
           NEWSAPI_API_KEY: ${{ secrets.NEWSAPI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
