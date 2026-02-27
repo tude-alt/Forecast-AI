@@ -27,12 +27,7 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Use Tavily for semantic search
 from tavily import TavilyClient
-
-# TinyFish is used as a live web automation API for surfacing recent news. The
-# TinyFish API does not have a dedicated news endpoint, but we can instruct an
-# agent to search for recent articles and return structured results.
 import requests
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
@@ -65,7 +60,7 @@ CROWD_BLEND_MIXED = float(os.getenv("CROWD_BLEND_MIXED", "0.65"))
 MIN_P = float(os.getenv("MIN_P", "0.01"))
 MAX_P = float(os.getenv("MAX_P", "0.99"))
 
-# You said: must use research at all times
+# Research must be used at all times
 REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true", "yes")
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
@@ -79,7 +74,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
     except Exception:
         pass
 
-    # Try several common "url-ish" attribute names that may exist on Metaculus objects
     for attr in ("url", "question_url", "page_url", "web_url", "permalink", "link"):
         try:
             url = str(getattr(question, attr, "") or "")
@@ -89,7 +83,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
         except Exception:
             continue
 
-    # Last resort: try string representation
     try:
         s = str(question)
         m = re.search(r"/questions/(\d+)(?:/|$)", s)
@@ -97,7 +90,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
             return m.group(1)
     except Exception:
         pass
-
     return "unknown"
 
 
@@ -138,33 +130,30 @@ def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
 
 def is_meaningful_research_text(txt: str) -> bool:
     """
-    Decide if a research string contains meaningful content.
-    This is intentionally permissive (to avoid false negatives) while still
-    rejecting obvious errors/timeouts.
+    Determine if a research string contains meaningful content.
+    - Avoid false negatives by accepting structured short outputs.
+    - Still require actual content, not just status lines.
     """
     if not txt:
         return False
-    low = txt.lower()
-    if "failed:" in low or "error:" in low:
-        return False
 
     s = txt.strip()
-    if "timeout" in low:
-        # Could still include partial content, but most of our timeouts are pure messages
-        # Let length/structure decide.
-        pass
+    low = s.lower()
 
-    # Accept reasonably short, structured outputs
-    if len(s) >= 60:
-        return True
+    if len(s) < 40:
+        return False
+
     if "source:" in low:
+        return True
+
+    if "title:" in low and "snippet:" in low:
         return True
 
     bullets = sum(1 for line in s.splitlines() if line.strip().startswith("-"))
     if bullets >= 2:
         return True
 
-    return False
+    return len(s) >= 120
 
 
 def is_research_sufficient(research_by_source: Dict[str, str]) -> bool:
@@ -284,7 +273,6 @@ def derive_numeric_fallback_percentiles(question: NumericQuestion, anchor: Optio
 
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
-    """Format the raw research by source into a single text block for summarization."""
     blocks: List[str] = []
     for src in ["tavily", "tinyfish"]:
         txt = (research_by_source or {}).get(src, "") or ""
@@ -301,7 +289,6 @@ def log_forecast_for_calibration(
     research_used: bool,
     searchers_used: list[str],
 ):
-    """Record a calibration entry so the bot can be assessed over time."""
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "question_id": extract_question_id(question),
@@ -323,7 +310,6 @@ def log_forecast_for_calibration(
 
 
 async def with_timeout(coro, seconds: float, label: str) -> str:
-    """Run a coroutine with a timeout and return a human-readable status on failure."""
     try:
         return await asyncio.wait_for(coro, timeout=seconds)
     except asyncio.TimeoutError:
@@ -370,11 +356,6 @@ def build_comment(
 
 
 class Tude(ForecastBot):
-    """
-    Tude is a Metaculus forecasting bot that uses research from Tavily and TinyFish
-    to update base rates using Good Judgment style heuristics. It aggregates
-    predictions from multiple language models to provide calibrated estimates.
-    """
     _max_concurrent_questions = MAX_CONCURRENT_QUESTIONS
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -388,23 +369,19 @@ class Tude(ForecastBot):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        # IMPORTANT: don't rely on tavily_client.api_key existing
+        self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
         self.tinyfish_api_key = TINYFISH_API_KEY
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
-        # Fail fast if research is required but no research backends are configured.
-        if REQUIRE_RESEARCH and not (TAVILY_API_KEY or self.tinyfish_api_key):
+        # If research is required, ensure at least one backend is configured.
+        if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key):
             raise RuntimeError(
                 "REQUIRE_RESEARCH=true but no research providers are configured. "
                 "Set TAVILY_API_KEY and/or TINYFISH_API_KEY."
             )
 
-    # TinyFish integration ---------------------------------------------------
     def call_tinyfish(self, query: str) -> str:
-        """
-        Use TinyFish's automation API to search for recent news articles related to a
-        query and return a formatted string of bullet points.
-        """
         if not self.tinyfish_api_key:
             return ""
         try:
@@ -416,7 +393,6 @@ class Tude(ForecastBot):
             )
             payload = {"url": "https://news.google.com", "goal": goal}
             headers = {"X-API-Key": self.tinyfish_api_key, "Content-Type": "application/json"}
-
             resp = requests.post(
                 "https://agent.tinyfish.ai/v1/automation/run",
                 json=payload,
@@ -428,7 +404,6 @@ class Tude(ForecastBot):
             data = resp.json() if resp.content else {}
             result = data.get("resultJson") or data.get("result") or {}
             articles = result.get("articles") or result.get("results") or []
-
             lines: List[str] = []
             for a in articles[:6]:
                 if not isinstance(a, dict):
@@ -448,31 +423,28 @@ class Tude(ForecastBot):
         except Exception as e:
             return f"TinyFish API failed: {e}"
 
-    # Tavily wrapper ---------------------------------------------------------
     def call_tavily(self, query: str) -> str:
-        if not getattr(self.tavily_client, "api_key", None):
+        if not self.tavily_client:
             return ""
         try:
             response = self.tavily_client.search(query=query, search_depth="advanced")
             results = response.get("results", []) or []
-
             lines: List[str] = []
             for r in results[:8]:
                 title = (r.get("title") or "").strip()
                 content = (r.get("content") or "").strip()
                 snippet = (r.get("snippet") or "").strip()
                 url = (r.get("url") or "").strip()
-
                 body = content or snippet
                 if title or body:
                     lines.append(
                         f"- {title + ': ' if title else ''}{body}\n"
                         f"  Source: {url or 'N/A'}"
                     )
-
             return "\n".join(lines).strip()
         except Exception as e:
-            return f"Tavily failed: {e}"
+            # Keep errors (used in diagnostics)
+            return f"Tavily error: {e}"
 
     async def _expand_queries_with_gpt52(self, question_text: str) -> List[str]:
         researcher_llm = self.get_llm("researcher", "llm")
@@ -495,7 +467,7 @@ class Tude(ForecastBot):
                 if k not in seen:
                     seen.add(k)
                     out.append(q)
-            return out[:6]
+            return out[:8]
         except Exception:
             return [question_text.strip()]
 
@@ -509,20 +481,33 @@ class Tude(ForecastBot):
 
             tav_parts: List[str] = []
             tni_parts: List[str] = []
+            tav_errs: List[str] = []
+            tni_errs: List[str] = []
 
-            # Query both Tavily and TinyFish on the first few expanded queries.
-            for i, q in enumerate(expanded_queries[:3]):
-                tav = await with_timeout(asyncio.to_thread(self.call_tavily, q), RESEARCH_TIMEOUT_S, f"tavily_{i}")
-                if is_meaningful_research_text(tav):
-                    tav_parts.append(f"## Query: {q}\n{tav}")
-                else:
-                    logger.info(f"Q{extract_question_id(question)} tavily_{i} not meaningful (len={len((tav or '').strip())})")
+            max_queries = min(5, len(expanded_queries))
 
-                tni = await with_timeout(asyncio.to_thread(self.call_tinyfish, q), RESEARCH_TIMEOUT_S, f"tinyfish_{i}")
-                if is_meaningful_research_text(tni):
-                    tni_parts.append(f"## Query: {q}\n{tni}")
-                else:
-                    logger.info(f"Q{extract_question_id(question)} tinyfish_{i} not meaningful (len={len((tni or '').strip())})")
+            for i, q in enumerate(expanded_queries[:max_queries]):
+                tav_raw = await with_timeout(
+                    asyncio.to_thread(self.call_tavily, q),
+                    RESEARCH_TIMEOUT_S,
+                    f"tavily_{i}",
+                )
+                tav_raw = (tav_raw or "").strip()
+                if is_meaningful_research_text(tav_raw):
+                    tav_parts.append(f"## Query: {q}\n{tav_raw}")
+                elif tav_raw:
+                    tav_errs.append(f"[tavily_{i}] {tav_raw[:500]}")
+
+                tni_raw = await with_timeout(
+                    asyncio.to_thread(self.call_tinyfish, q),
+                    RESEARCH_TIMEOUT_S,
+                    f"tinyfish_{i}",
+                )
+                tni_raw = (tni_raw or "").strip()
+                if is_meaningful_research_text(tni_raw):
+                    tni_parts.append(f"## Query: {q}\n{tni_raw}")
+                elif tni_raw:
+                    tni_errs.append(f"[tinyfish_{i}] {tni_raw[:500]}")
 
             tav_all = "\n\n".join(tav_parts).strip()
             tni_all = "\n\n".join(tni_parts).strip()
@@ -533,16 +518,24 @@ class Tude(ForecastBot):
                 if is_meaningful_research_text(research_by_source.get(s, ""))
             ]
 
-            # Enforce "must use research"
             if REQUIRE_RESEARCH and not is_research_sufficient(research_by_source):
                 qid = extract_question_id(question)
-                tav_len = len((research_by_source.get("tavily") or "").strip())
-                tni_len = len((research_by_source.get("tinyfish") or "").strip())
+                tav_len = len((tav_all or "").strip())
+                tni_len = len((tni_all or "").strip())
+
+                diag = []
+                if tav_errs:
+                    diag.append("Tavily diagnostics:\n" + "\n".join(tav_errs[:3]))
+                if tni_errs:
+                    diag.append("TinyFish diagnostics:\n" + "\n".join(tni_errs[:3]))
+                diag_text = ("\n\n".join(diag)).strip() or "No provider output captured."
+
                 raise RuntimeError(
                     f"Insufficient research for Q{qid}; refusing to forecast. "
                     f"Providers configured: tavily={'yes' if TAVILY_API_KEY else 'no'}, "
                     f"tinyfish={'yes' if self.tinyfish_api_key else 'no'}. "
-                    f"Research lengths: tavily={tav_len}, tinyfish={tni_len}."
+                    f"Research lengths: tavily={tav_len}, tinyfish={tni_len}.\n\n"
+                    f"{diag_text}"
                 )
 
             raw_block = format_research_block(research_by_source)
