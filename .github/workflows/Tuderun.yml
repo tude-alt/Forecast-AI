@@ -3,7 +3,7 @@ name: predict AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/40 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "*/30 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
 concurrency:
   group: ${{ github.workflow }}
