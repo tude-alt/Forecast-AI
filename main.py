@@ -134,22 +134,17 @@ def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
 def is_meaningful_research_text(txt: str) -> bool:
     if not txt:
         return False
-
     s = txt.strip()
     low = s.lower()
-
     if len(s) < 40:
         return False
-
     if "source:" in low:
         return True
     if "title:" in low and "snippet:" in low:
         return True
-
     bullets = sum(1 for line in s.splitlines() if line.strip().startswith("-"))
     if bullets >= 2:
         return True
-
     return len(s) >= 120
 
 
@@ -387,8 +382,6 @@ class Tude(ForecastBot):
             return ""
 
         encoded_query = query.replace("\n", " ").strip()
-
-        # Make goal cheaper/faster (3 articles instead of 5)
         goal = (
             f'Find the top 3 recent news articles about "{encoded_query}". '
             "Return JSON with an 'articles' array where each item has keys: "
@@ -444,7 +437,6 @@ class Tude(ForecastBot):
         try:
             response = self.tavily_client.search(query=query, search_depth="advanced")
             results = response.get("results", []) or []
-
             lines: List[str] = []
             for r in results[:10]:
                 title = (r.get("title") or "").strip()
@@ -499,7 +491,6 @@ class Tude(ForecastBot):
             tav_errs: List[str] = []
             tni_errs: List[str] = []
 
-            # Try more queries to avoid the "3 queries all miss" failure mode
             max_queries = min(6, len(expanded_queries))
 
             for i, q in enumerate(expanded_queries[:max_queries]):
@@ -779,13 +770,25 @@ class Tude(ForecastBot):
         for model in models:
             try:
                 pred, _ = await self._single_forecast(question, research, model_override=model)
-                m = {o["option"]: max(0.0, float(o["probability"])) for o in pred.predicted_options}
+                # pred.predicted_options may be list of dicts or pydantic models
+                mapped: Dict[str, float] = {}
+                for o in getattr(pred, "predicted_options", []) or []:
+                    if isinstance(o, dict):
+                        opt = o.get("option")
+                        prob = o.get("probability")
+                    else:
+                        opt = getattr(o, "option", None)
+                        prob = getattr(o, "probability", None)
+                    if opt is None:
+                        continue
+                    mapped[str(opt)] = max(0.0, float(prob) if prob is not None else 0.0)
+
                 for opt in question.options:
-                    m.setdefault(opt, 0.0)
-                s = sum(m.values()) or 1.0
-                for k in list(m.keys()):
-                    m[k] = m[k] / s
-                per_model_maps.append(m)
+                    mapped.setdefault(opt, 0.0)
+                s = sum(mapped.values()) or 1.0
+                for k in list(mapped.keys()):
+                    mapped[k] = mapped[k] / s
+                per_model_maps.append(mapped)
             except Exception as e:
                 n = len(question.options)
                 per_model_maps.append({opt: 1.0 / n for opt in question.options})
@@ -800,7 +803,10 @@ class Tude(ForecastBot):
         med = np.maximum(med, floor)
         med = med / med.sum()
 
-        out = PredictedOptionList([{"option": opt, "probability": float(p)} for opt, p in zip(option_list, med)])
+        # ✅ FIX: PredictedOptionList is a pydantic BaseModel; it expects keyword args
+        out = PredictedOptionList(
+            predicted_options=[{"option": opt, "probability": float(p)} for opt, p in zip(option_list, med)]
+        )
 
         meta = self._research_meta.get(qid, {})
         searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
@@ -851,7 +857,7 @@ class Tude(ForecastBot):
 
         aggregated: List[Percentile] = []
         for i, p in enumerate(target_ps):
-            aggregated.append(Percentile(p, float(np.median([pm[i].value for pm in per_model_percentiles]))))
+            aggregated.append(Percentile(percentile=p, value=float(np.median([pm[i].value for pm in per_model_percentiles]))))
 
         validated = enforce_numeric_constraints(aggregated, question)
         if not validated or len(validated) != 6:
