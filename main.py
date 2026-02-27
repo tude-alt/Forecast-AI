@@ -43,6 +43,12 @@ logger = logging.getLogger("Tude")
 RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "25"))
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "70"))
 
+# TinyFish robustness knobs
+TINYFISH_HTTP_TIMEOUT_S = float(os.getenv("TINYFISH_HTTP_TIMEOUT_S", "60"))
+TINYFISH_RETRY_MAX = int(os.getenv("TINYFISH_RETRY_MAX", "3"))
+TINYFISH_RETRY_BASE_S = float(os.getenv("TINYFISH_RETRY_BASE_S", "2.0"))
+TINYFISH_RETRY_MAX_S = float(os.getenv("TINYFISH_RETRY_MAX_S", "25.0"))
+
 MAX_CONCURRENT_QUESTIONS = int(os.getenv("MAX_CONCURRENT_QUESTIONS", "1"))
 PUBLISH_SLEEP_S = float(os.getenv("PUBLISH_SLEEP_S", "3.0"))
 TOURNAMENT_SLEEP_S = float(os.getenv("TOURNAMENT_SLEEP_S", "8.0"))
@@ -60,13 +66,11 @@ CROWD_BLEND_MIXED = float(os.getenv("CROWD_BLEND_MIXED", "0.65"))
 MIN_P = float(os.getenv("MIN_P", "0.01"))
 MAX_P = float(os.getenv("MAX_P", "0.99"))
 
-# Research must be used at all times
 REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true", "yes")
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 
 def extract_question_id(question: MetaculusQuestion) -> str:
-    """Extract a numeric question identifier from various attributes of a question."""
     try:
         qid = getattr(question, "id", None)
         if isinstance(qid, (int, str)) and str(qid).isdigit():
@@ -94,7 +98,6 @@ def extract_question_id(question: MetaculusQuestion) -> str:
 
 
 def safe_community_prediction(question: MetaculusQuestion) -> Optional[float]:
-    """Get the community prediction from a Metaculus question if available."""
     try:
         pred = getattr(question, "community_prediction", None)
         if pred is not None and isinstance(pred, (int, float)):
@@ -129,11 +132,6 @@ def should_extremize(p: float, threshold: float = EXTREMIZE_THRESHOLD) -> bool:
 
 
 def is_meaningful_research_text(txt: str) -> bool:
-    """
-    Determine if a research string contains meaningful content.
-    - Avoid false negatives by accepting structured short outputs.
-    - Still require actual content, not just status lines.
-    """
     if not txt:
         return False
 
@@ -145,7 +143,6 @@ def is_meaningful_research_text(txt: str) -> bool:
 
     if "source:" in low:
         return True
-
     if "title:" in low and "snippet:" in low:
         return True
 
@@ -324,6 +321,12 @@ def backoff_sleep(attempt: int) -> None:
     time.sleep(base + jitter)
 
 
+def _tinyfish_backoff(attempt: int) -> None:
+    base = min(TINYFISH_RETRY_MAX_S, TINYFISH_RETRY_BASE_S * (2 ** attempt))
+    jitter = random.uniform(0.0, base * 0.25)
+    time.sleep(base + jitter)
+
+
 def build_comment(
     question: MetaculusQuestion,
     forecast_text: str,
@@ -369,12 +372,10 @@ class Tude(ForecastBot):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # IMPORTANT: don't rely on tavily_client.api_key existing
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
         self.tinyfish_api_key = TINYFISH_API_KEY
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
-        # If research is required, ensure at least one backend is configured.
         if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key):
             raise RuntimeError(
                 "REQUIRE_RESEARCH=true but no research providers are configured. "
@@ -384,44 +385,58 @@ class Tude(ForecastBot):
     def call_tinyfish(self, query: str) -> str:
         if not self.tinyfish_api_key:
             return ""
-        try:
-            encoded_query = query.replace("\n", " ").strip()
-            goal = (
-                f'Find the top 5 recent news articles about "{encoded_query}". '
-                "Return JSON with an 'articles' array where each item has keys: title, "
-                "published, snippet, and url."
-            )
-            payload = {"url": "https://news.google.com", "goal": goal}
-            headers = {"X-API-Key": self.tinyfish_api_key, "Content-Type": "application/json"}
-            resp = requests.post(
-                "https://agent.tinyfish.ai/v1/automation/run",
-                json=payload,
-                headers=headers,
-                timeout=20,
-            )
-            if not resp.ok:
-                return f"TinyFish API error: {resp.status_code}"
-            data = resp.json() if resp.content else {}
-            result = data.get("resultJson") or data.get("result") or {}
-            articles = result.get("articles") or result.get("results") or []
-            lines: List[str] = []
-            for a in articles[:6]:
-                if not isinstance(a, dict):
+
+        encoded_query = query.replace("\n", " ").strip()
+
+        # Make goal cheaper/faster (3 articles instead of 5)
+        goal = (
+            f'Find the top 3 recent news articles about "{encoded_query}". '
+            "Return JSON with an 'articles' array where each item has keys: "
+            "title, published, snippet, and url."
+        )
+        payload = {"url": "https://news.google.com", "goal": goal}
+        headers = {"X-API-Key": self.tinyfish_api_key, "Content-Type": "application/json"}
+
+        last_err: Optional[str] = None
+        for attempt in range(TINYFISH_RETRY_MAX):
+            try:
+                resp = requests.post(
+                    "https://agent.tinyfish.ai/v1/automation/run",
+                    json=payload,
+                    headers=headers,
+                    timeout=TINYFISH_HTTP_TIMEOUT_S,
+                )
+                if not resp.ok:
+                    last_err = f"TinyFish API error: {resp.status_code}"
+                    _tinyfish_backoff(attempt)
                     continue
-                title = (a.get("title") or "").strip()
-                desc = (a.get("snippet") or a.get("description") or "").strip()
-                url = (a.get("url") or "").strip()
-                published = (a.get("published") or a.get("date") or "").strip()
-                if title or desc:
-                    lines.append(
-                        f"- Title: {title}\n"
-                        f"  Published: {published or 'N/A'}\n"
-                        f"  Snippet: {desc or 'N/A'}\n"
-                        f"  Source: {url or 'N/A'}"
-                    )
-            return "\n".join(lines).strip()
-        except Exception as e:
-            return f"TinyFish API failed: {e}"
+
+                data = resp.json() if resp.content else {}
+                result = data.get("resultJson") or data.get("result") or {}
+                articles = result.get("articles") or result.get("results") or []
+
+                lines: List[str] = []
+                for a in articles[:6]:
+                    if not isinstance(a, dict):
+                        continue
+                    title = (a.get("title") or "").strip()
+                    desc = (a.get("snippet") or a.get("description") or "").strip()
+                    url = (a.get("url") or "").strip()
+                    published = (a.get("published") or a.get("date") or "").strip()
+                    if title or desc:
+                        lines.append(
+                            f"- Title: {title}\n"
+                            f"  Published: {published or 'N/A'}\n"
+                            f"  Snippet: {desc or 'N/A'}\n"
+                            f"  Source: {url or 'N/A'}"
+                        )
+                return "\n".join(lines).strip()
+
+            except Exception as e:
+                last_err = f"TinyFish API failed: {e}"
+                _tinyfish_backoff(attempt)
+
+        return last_err or "TinyFish API failed: unknown error"
 
     def call_tavily(self, query: str) -> str:
         if not self.tavily_client:
@@ -429,8 +444,9 @@ class Tude(ForecastBot):
         try:
             response = self.tavily_client.search(query=query, search_depth="advanced")
             results = response.get("results", []) or []
+
             lines: List[str] = []
-            for r in results[:8]:
+            for r in results[:10]:
                 title = (r.get("title") or "").strip()
                 content = (r.get("content") or "").strip()
                 snippet = (r.get("snippet") or "").strip()
@@ -443,13 +459,12 @@ class Tude(ForecastBot):
                     )
             return "\n".join(lines).strip()
         except Exception as e:
-            # Keep errors (used in diagnostics)
             return f"Tavily error: {e}"
 
     async def _expand_queries_with_gpt52(self, question_text: str) -> List[str]:
         researcher_llm = self.get_llm("researcher", "llm")
         prompt = clean_indents(f"""
-        Generate 5 concise web search queries to research this forecasting question.
+        Generate 6 concise web search queries to research this forecasting question.
         Mix: entities, resolution criteria terms, and newest-updates phrasing.
         Output JSON ONLY: {{"queries":["...","..."]}}
 
@@ -467,7 +482,7 @@ class Tude(ForecastBot):
                 if k not in seen:
                     seen.add(k)
                     out.append(q)
-            return out[:8]
+            return out[:10]
         except Exception:
             return [question_text.strip()]
 
@@ -484,7 +499,8 @@ class Tude(ForecastBot):
             tav_errs: List[str] = []
             tni_errs: List[str] = []
 
-            max_queries = min(5, len(expanded_queries))
+            # Try more queries to avoid the "3 queries all miss" failure mode
+            max_queries = min(6, len(expanded_queries))
 
             for i, q in enumerate(expanded_queries[:max_queries]):
                 tav_raw = await with_timeout(
@@ -525,9 +541,9 @@ class Tude(ForecastBot):
 
                 diag = []
                 if tav_errs:
-                    diag.append("Tavily diagnostics:\n" + "\n".join(tav_errs[:3]))
+                    diag.append("Tavily diagnostics:\n" + "\n".join(tav_errs[:4]))
                 if tni_errs:
-                    diag.append("TinyFish diagnostics:\n" + "\n".join(tni_errs[:3]))
+                    diag.append("TinyFish diagnostics:\n" + "\n".join(tni_errs[:4]))
                 diag_text = ("\n\n".join(diag)).strip() or "No provider output captured."
 
                 raise RuntimeError(
@@ -695,7 +711,6 @@ class Tude(ForecastBot):
                 vals = [p.value for p in validated]
                 if len(set([round(v, 12) for v in vals])) == 1:
                     validated = derive_numeric_fallback_percentiles(question, base_rate)
-
             except Exception:
                 validated = derive_numeric_fallback_percentiles(question, base_rate)
 
@@ -861,12 +876,7 @@ class Tude(ForecastBot):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Tude.")
-    parser.add_argument(
-        "--tournament-ids",
-        nargs="+",
-        type=str,
-        default=None,
-    )
+    parser.add_argument("--tournament-ids", nargs="+", type=str, default=None)
     args = parser.parse_args()
 
     client = MetaculusClient()
