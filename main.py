@@ -22,6 +22,7 @@ from forecasting_tools import (
     Percentile,
     BinaryPrediction,
     PredictedOptionList,
+    PredictedOption,
     ReasonedPrediction,
     clean_indents,
     structure_output,
@@ -298,7 +299,7 @@ def log_forecast_for_calibration(
         with open(CALIBRATION_LOG_FILE, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
     except Exception as e:
-        logger.warning(f"Failed to log calibration data: {e}")
+        logger.warning(f"Failed to log calibration  {e}")
 
 
 async def with_timeout(coro, seconds: float, label: str) -> str:
@@ -353,6 +354,14 @@ def build_comment(
     """).strip()
 
 
+def _normalize_predicted_option(raw: dict) -> dict:
+    """Ensure option dict uses 'option_name' field for Pydantic compatibility."""
+    result = raw.copy()
+    if "option" in result and "option_name" not in result:
+        result["option_name"] = result.pop("option")
+    return result
+
+
 class Tude(ForecastBot):
     _max_concurrent_questions = MAX_CONCURRENT_QUESTIONS
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
@@ -387,14 +396,14 @@ class Tude(ForecastBot):
             "Return JSON with an 'articles' array where each item has keys: "
             "title, published, snippet, and url."
         )
-        payload = {"url": "https://news.google.com", "goal": goal}
+        payload = {"url": "https://news.google.com ", "goal": goal}
         headers = {"X-API-Key": self.tinyfish_api_key, "Content-Type": "application/json"}
 
         last_err: Optional[str] = None
         for attempt in range(TINYFISH_RETRY_MAX):
             try:
                 resp = requests.post(
-                    "https://agent.tinyfish.ai/v1/automation/run",
+                    "https://agent.tinyfish.ai/v1/automation/run ",
                     json=payload,
                     headers=headers,
                     timeout=TINYFISH_HTTP_TIMEOUT_S,
@@ -630,6 +639,7 @@ class Tude(ForecastBot):
             return clamp01(float(pred.prediction_in_decimal)), str(raw)
 
         if isinstance(question, MultipleChoiceQuestion):
+            # ✅ FIXED: Use "option_name" instead of "option" in prompt
             prompt = clean_indents(f"""
             {good_judgment}
 
@@ -647,11 +657,12 @@ class Tude(ForecastBot):
             Output JSON ONLY:
             {{
               "predicted_options": [
-                {{"option":"<exact option>","probability": number}},
+                {{"option_name":"<exact option>","probability": number}},
                 ...
               ]
             }}
-            Constraints: include all options once; probabilities sum to 1.
+            IMPORTANT: Use "option_name" (NOT "option") as the field name for each option.
+            Constraints: include all options exactly once; probabilities must sum to 1.0.
             """).strip()
             raw = await with_timeout(llm.invoke(prompt), LLM_TIMEOUT_S, "mc_llm")
             result = await structure_output(
@@ -660,6 +671,9 @@ class Tude(ForecastBot):
                 model=parser_llm,
                 additional_instructions=f"Options must be exactly: {question.options}"
             )
+            # ✅ Normalize any stray field names for robustness
+            normalized_options = [_normalize_predicted_option(o) if isinstance(o, dict) else o for o in result.predicted_options]
+            result = PredictedOptionList(predicted_options=normalized_options)
             return result, str(raw)
 
         if isinstance(question, NumericQuestion):
@@ -774,10 +788,11 @@ class Tude(ForecastBot):
                 mapped: Dict[str, float] = {}
                 for o in getattr(pred, "predicted_options", []) or []:
                     if isinstance(o, dict):
-                        opt = o.get("option")
+                        # ✅ Handle both field name variants for robustness
+                        opt = o.get("option_name") or o.get("option")
                         prob = o.get("probability")
                     else:
-                        opt = getattr(o, "option", None)
+                        opt = getattr(o, "option_name", None) or getattr(o, "option", None)
                         prob = getattr(o, "probability", None)
                     if opt is None:
                         continue
@@ -803,17 +818,20 @@ class Tude(ForecastBot):
         med = np.maximum(med, floor)
         med = med / med.sum()
 
-        # ✅ FIX: PredictedOptionList is a pydantic BaseModel; it expects keyword args
+        # ✅ FIX: Use "option_name" to match PredictedOptionList Pydantic schema
         out = PredictedOptionList(
-            predicted_options=[{"option": opt, "probability": float(p)} for opt, p in zip(option_list, med)]
+            predicted_options=[{"option_name": opt, "probability": float(p)} for opt, p in zip(option_list, med)]
         )
 
         meta = self._research_meta.get(qid, {})
         searchers_used = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used", None), list) else []
 
+        # ✅ FIX: Access 'option_name' not 'option'
+        forecast_text = ", ".join([f"{x['option_name']}: {x['probability']:.1%}" for x in out.predicted_options])
+        
         comment = build_comment(
             question,
-            forecast_text=", ".join([f"{x['option']}: {x['probability']:.1%}" for x in out.predicted_options]),
+            forecast_text=forecast_text,
             base_rate_text="(see community chart on Metaculus)",
             how_text=f"- Committee median per option + floor={floor:.6f}\n- Used research + Good Judgment updating.",
             searchers_used=searchers_used,
@@ -821,7 +839,7 @@ class Tude(ForecastBot):
         )
         log_forecast_for_calibration(
             question,
-            [x["probability"] for x in out.predicted_options],
+            [{"option_name": x["option_name"], "probability": x["probability"]} for x in out.predicted_options],
             comment,
             models,
             True,
