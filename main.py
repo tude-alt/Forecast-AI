@@ -38,6 +38,7 @@ from tavily import TavilyClient
 # ---------------------------------------------------------------------------
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 TINYFISH_API_KEY = os.getenv("TINYFISH_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,7 +80,8 @@ CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 # FIX 8 – single source of truth for committee models
 COMMITTEE_MODELS: List[str] = [
     "openrouter/openai/gpt-5.4",
-    "openrouter/openai/gpt-5.1",
+    "openrouter/openai/gpt-5-search",
+    "openrouter/openai/gpt-5-perplexity",
     "openrouter/anthropic/claude-sonnet-4.6",
 ]
 
@@ -366,7 +368,7 @@ def derive_numeric_fallback_percentiles(
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
     blocks: List[str] = []
-    for src in ["tavily", "tinyfish"]:
+    for src in ["tavily", "tinyfish", "openrouter_search", "openrouter_perplexity"]:
         txt = (research_by_source or {}).get(src, "") or ""
         if txt.strip():
             blocks.append(f"--- SOURCE {src.upper()} ---\n{txt}\n")
@@ -511,13 +513,14 @@ class Tude(ForecastBot):
         self._concurrency_limiter = asyncio.Semaphore(self._max_concurrent_questions)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
         self.tinyfish_api_key = TINYFISH_API_KEY
+        self.openrouter_api_key = OPENROUTER_API_KEY
         # FIX 6 – keyed by stable question URL, not potentially-"unknown" ID string
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
-        if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key):
+        if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key or self.openrouter_api_key):
             raise RuntimeError(
                 "REQUIRE_RESEARCH=true but no research providers are configured. "
-                "Set TAVILY_API_KEY and/or TINYFISH_API_KEY."
+                "Set TAVILY_API_KEY, TINYFISH_API_KEY, and/or OPENROUTER_API_KEY."
             )
 
     # -------------------------------------------------------------------------
@@ -596,8 +599,54 @@ class Tude(ForecastBot):
         except Exception as exc:
             return f"Tavily error: {exc}"
 
+    async def call_openrouter_async(self, query: str, model: str) -> str:
+        if not self.openrouter_api_key:
+            return ""
+        encoded_query = query.replace("\n", " ").strip()
+        prompt = clean_indents(f"""
+        You are a research assistant. For the query below, return the top 5 most relevant recent facts,
+        headlines, or source summaries that would help answer the question. Use bullet points and include
+        short citations or source descriptors where possible.
+
+        Query: {encoded_query}
+        """).strip()
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": 800,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        last_err = f"OpenRouter {model} API failed: unknown error"
+        async with httpx.AsyncClient(timeout=TINYFISH_HTTP_TIMEOUT_S) as client:
+            for attempt in range(TINYFISH_RETRY_MAX):
+                try:
+                    resp = await client.post(
+                        "https://openrouter.ai/v1/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+                    if not resp.is_success:
+                        last_err = f"OpenRouter {model} API error: {resp.status_code}"
+                        await _tinyfish_backoff_async(attempt)
+                        continue
+                    data = resp.json() if resp.content else {}
+                    choices = data.get("choices") or []
+                    if choices and isinstance(choices, list):
+                        text = (choices[0].get("message", {}).get("content") or "").strip()
+                        return text
+                    return data.get("result", "") or ""
+                except Exception as exc:
+                    last_err = f"OpenRouter {model} API failed: {exc}"
+                    await _tinyfish_backoff_async(attempt)
+        return last_err
+
     # -------------------------------------------------------------------------
     # Query expansion
+    # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
     async def _expand_queries(
         self, question_text: str, resolution_criteria: str = ""
@@ -687,16 +736,42 @@ class Tude(ForecastBot):
                 )
                 return q, (raw or "").strip()
 
+            async def _fetch_openrouter_search(q: str) -> Tuple[str, str]:
+                raw = await with_timeout(
+                    self.call_openrouter_async(q, "openrouter/openai/gpt-5-search"),
+                    RESEARCH_TIMEOUT_S,
+                    f"openrouter_search:{q[:40]}",
+                )
+                return q, (raw or "").strip()
+
+            async def _fetch_openrouter_perplexity(q: str) -> Tuple[str, str]:
+                raw = await with_timeout(
+                    self.call_openrouter_async(q, "openrouter/openai/gpt-5-perplexity"),
+                    RESEARCH_TIMEOUT_S,
+                    f"openrouter_perplexity:{q[:40]}",
+                )
+                return q, (raw or "").strip()
+
             tav_coros = [_fetch_tavily(q) for q in queries]
             tni_coros = [_fetch_tinyfish(q) for q in queries]
-            all_results = await asyncio.gather(*tav_coros, *tni_coros, return_exceptions=True)
+            ors_coros = [_fetch_openrouter_search(q) for q in queries]
+            orp_coros = [_fetch_openrouter_perplexity(q) for q in queries]
+            all_results = await asyncio.gather(
+                *tav_coros, *tni_coros, *ors_coros, *orp_coros, return_exceptions=True
+            )
 
             tav_parts: List[str] = []
             tni_parts: List[str] = []
+            ors_parts: List[str] = []
+            orp_parts: List[str] = []
             tav_errs: List[str] = []
             tni_errs: List[str] = []
+            ors_errs: List[str] = []
+            orp_errs: List[str] = []
 
-            for res in all_results[:max_queries]:
+            idx = 0
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
                 if isinstance(res, Exception):
                     tav_errs.append(str(res))
                     continue
@@ -706,7 +781,8 @@ class Tude(ForecastBot):
                 elif raw:
                     tav_errs.append(f"[tavily] {raw[:500]}")
 
-            for res in all_results[max_queries:]:
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
                 if isinstance(res, Exception):
                     tni_errs.append(str(res))
                     continue
@@ -716,11 +792,40 @@ class Tude(ForecastBot):
                 elif raw:
                     tni_errs.append(f"[tinyfish] {raw[:500]}")
 
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
+                if isinstance(res, Exception):
+                    ors_errs.append(str(res))
+                    continue
+                q, raw = res
+                if is_meaningful_research_text(raw):
+                    ors_parts.append(f"## Query: {q}\n{raw}")
+                elif raw:
+                    ors_errs.append(f"[openrouter_search] {raw[:500]}")
+
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
+                if isinstance(res, Exception):
+                    orp_errs.append(str(res))
+                    continue
+                q, raw = res
+                if is_meaningful_research_text(raw):
+                    orp_parts.append(f"## Query: {q}\n{raw}")
+                elif raw:
+                    orp_errs.append(f"[openrouter_perplexity] {raw[:500]}")
+
             tav_all = "\n\n".join(tav_parts).strip()
             tni_all = "\n\n".join(tni_parts).strip()
-            research_by_source = {"tavily": tav_all, "tinyfish": tni_all}
+            ors_all = "\n\n".join(ors_parts).strip()
+            orp_all = "\n\n".join(orp_parts).strip()
+            research_by_source = {
+                "tavily": tav_all,
+                "tinyfish": tni_all,
+                "openrouter_search": ors_all,
+                "openrouter_perplexity": orp_all,
+            }
             searchers_used = [
-                s for s in ["tavily", "tinyfish"]
+                s for s in ["tavily", "tinyfish", "openrouter_search", "openrouter_perplexity"]
                 if is_meaningful_research_text(research_by_source.get(s, ""))
             ]
 
@@ -731,12 +836,18 @@ class Tude(ForecastBot):
                     diag.append("Tavily diagnostics:\n" + "\n".join(tav_errs[:4]))
                 if tni_errs:
                     diag.append("TinyFish diagnostics:\n" + "\n".join(tni_errs[:4]))
+                if ors_errs:
+                    diag.append("OpenRouter search diagnostics:\n" + "\n".join(ors_errs[:4]))
+                if orp_errs:
+                    diag.append("OpenRouter perplexity diagnostics:\n" + "\n".join(orp_errs[:4]))
                 diag_text = ("\n\n".join(diag)).strip() or "No provider output captured."
                 raise RuntimeError(
                     f"Insufficient research for Q{qid}; refusing to forecast. "
                     f"Providers configured: tavily={'yes' if TAVILY_API_KEY else 'no'}, "
-                    f"tinyfish={'yes' if self.tinyfish_api_key else 'no'}. "
-                    f"Research lengths: tavily={len(tav_all)}, tinyfish={len(tni_all)}.\n\n"
+                    f"tinyfish={'yes' if self.tinyfish_api_key else 'no'}, "
+                    f"openrouter={'yes' if self.openrouter_api_key else 'no'}. "
+                    f"Research lengths: tavily={len(tav_all)}, tinyfish={len(tni_all)}, "
+                    f"openrouter_search={len(ors_all)}, openrouter_perplexity={len(orp_all)}.\n\n"
                     f"{diag_text}"
                 )
 
@@ -1147,6 +1258,15 @@ class Tude(ForecastBot):
                     "Q%s: skipping crowd blend (log-odds gap=%.2f > threshold=%.2f)",
                     qid, lo_gap, CROWD_BLEND_DISAGREE_LOGODDS,
                 )
+
+        # Enforce minibench extremization behavior: avoid weak middle forecasts.
+        # If the committee is aligned and the aggregate is near 50%, push to
+        # a decisive extreme. Otherwise, fall back to an honest 50/50.
+        if 0.45 <= p_final <= 0.55:
+            if agree and p_agg != 0.5:
+                p_final = 0.02 if p_agg < 0.5 else 0.98
+            else:
+                p_final = 0.50
 
         meta = self._research_meta.get(_question_key(question), {})
         searchers_used: List[str] = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used"), list) else []
