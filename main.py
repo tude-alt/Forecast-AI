@@ -82,11 +82,9 @@ REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true"
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 # FIX 8 – single source of truth for committee models
-# FIX 17 – replaced gpt-5-perplexity with actual Perplexity online model
+# FIX 17 – web-search models are research-only sources, not committee voting models
 COMMITTEE_MODELS: List[str] = [
     "openrouter/openai/gpt-5.4",
-    "openrouter/openai/gpt-5-search",
-    "openrouter/perplexity/sonar-pro",
     "openrouter/anthropic/claude-sonnet-4.6",
 ]
 
@@ -471,7 +469,7 @@ def _get_tournament_id(question: MetaculusQuestion) -> str:
 def _is_aggressive_tournament(question: MetaculusQuestion) -> bool:
     """FIX 18 – Return True if question is from minibench or market-pulse (allow aggressive forecasts)."""
     tid = _get_tournament_id(question)
-    aggressive_tournaments = ["minibench", "market-pulse", "market_pulse"]
+    aggressive_tournaments = ["minibench", "market-pulse", "market-pulse-26q2", "market_pulse"]
     return any(aggressive in tid for aggressive in aggressive_tournaments)
 
 
@@ -1628,10 +1626,12 @@ if __name__ == "__main__":
     default_ids = list(dict.fromkeys([
         "33022",
         "minibench",
+        "market-pulse-26q2",
         "33013",
         getattr(client, "CURRENT_MINIBENCH_ID", "minibench"),
     ]))
     tournament_ids = args.tournament_ids or default_ids
+    tournament_ids = [tid for tid in tournament_ids if str(tid) != "32916"]
 
     bot = Tude(
         research_reports_per_question=1,
