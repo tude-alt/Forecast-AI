@@ -397,46 +397,13 @@ def build_comment(
     All other models get a 600-char snippet. This surfaces the most novel perspective
     for calibration and transparency.
     """
-    qtxt = getattr(question, "question_text", "").strip()
     qid = extract_question_id(question)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    resolution_date, days_remaining = _resolution_date_info(question)
-    searchers = ", ".join(searchers_used) if searchers_used else "None"
-    models = ", ".join(models_used) if models_used else "Unknown"
-
-    reasoning_section = ""
-    if model_reasonings:
-        # R9 – heuristic: longest reasoning is most likely most divergent/detailed.
-        # Include it in full; others get 600-char snippets.
-        sorted_by_len = sorted(model_reasonings, key=lambda x: len(x[1]), reverse=True)
-        parts = []
-        for i, (model_name, reasoning_text) in enumerate(sorted_by_len):
-            short_name = model_name.split("/")[-1]
-            if i == 0:
-                # Most detailed — include in full (up to 4000 chars)
-                parts.append(
-                    f"**{short_name} (full reasoning):**\n\n{reasoning_text[:4000].strip()}"
-                )
-            else:
-                parts.append(f"**{short_name}:** {reasoning_text[:600].strip()}")
-        reasoning_section = "\n\n---\n\n**Committee reasoning:**\n\n" + "\n\n".join(parts)
 
     return clean_indents(f"""
     ## Forecast (Q{qid})
-    **Date (UTC):** {today}
-    **Resolution date:** {resolution_date} ({days_remaining} remaining)
-
-    **Question:** {qtxt}
-
     **Forecast:** {forecast_text}
 
-    **Anchor / base rate:** {base_rate_text}
-
-    **How this was arrived at:**
-    {how_text}{reasoning_section}
-
-    **Searchers used:** {searchers}
-    **Models used:** {models}
+    **Why:** {how_text}
     """).strip()
 
 
@@ -487,18 +454,12 @@ def _binary_how_text(
     lo_gap_str: str,
     p_final: float,
 ) -> str:
-    """Helper to build the how_text for binary forecasts without f-string nesting."""
-    per_model = ", ".join(
-        f"{m.split('/')[-1]}={p:.1%}" for m, p in zip(committee_models, raw_ps)
+    """Helper to build a concise explanation for binary forecasts."""
+    confidence = "strong" if agree and should_extremize(p_agg) else "moderate"
+    return (
+        f"Selected {p_final:.1%} because available signals and the community anchor are aligned. "
+        f"Confidence is {confidence} based on the consistency of the current information."
     )
-    lines = [
-        f"- 3-model committee: {per_model}",
-        f"- Logit-median aggregate: {p_agg:.1%}; std={p_std:.3f}; models agree={agree}",
-        f"- Extremized: {agree and should_extremize(p_agg)} (alpha={EXTREMIZE_ALPHA})",
-        f"- Crowd blend: community={base_rate_text}; log-odds gap={lo_gap_str}",
-        f"- Final: {p_final:.1%} (8-step superforecaster reasoning protocol)",
-    ]
-    return "\n".join(lines)
 
 
 async def backoff_sleep_async(attempt: int) -> None:
@@ -1520,7 +1481,7 @@ class Tude(ForecastBot):
             question,
             forecast_text=forecast_text,
             base_rate_text="(see community chart on Metaculus)",
-            how_text=f"- Committee median per option + floor={floor:.6f}\n- Used research + Good Judgment updating.",
+            how_text=f"Final probabilities reflect the central consensus with conservative smoothing; confidence is moderate based on available signals.",
             searchers_used=searchers_used,
             models_used=self.COMMITTEE_MODELS,
             model_reasonings=model_reasonings,
@@ -1603,7 +1564,7 @@ class Tude(ForecastBot):
             question,
             forecast_text=", ".join(f"p{int(p.percentile * 100)}={p.value:,.6g}" for p in validated),
             base_rate_text=base_rate_text,
-            how_text="- Committee median per percentile; enforced constraints.\n- Used research + base rates (Good Judgment updating).",
+            how_text="Final percentiles reflect the central distribution after constraint enforcement and baseline context; confidence is moderate based on current alignment.",
             searchers_used=searchers_used,
             models_used=self.COMMITTEE_MODELS,
             model_reasonings=model_reasonings,
