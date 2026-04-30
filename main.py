@@ -415,11 +415,19 @@ def _get_tournament_id(question: MetaculusQuestion) -> str:
     """FIX 18 – Extract tournament ID from question for conservative forecast logic."""
     try:
         # Try common tournament attributes
-        for attr in ("tournament_id", "tournament", "group_id", "group"):
+        for attr in (
+            "tournament_id",
+            "tournament",
+            "group_id",
+            "group",
+            "tournament_name",
+            "group_name",
+            "name",
+        ):
             val = getattr(question, attr, None)
             if val:
                 return str(val).lower()
-        
+
         # Try to extract from URL
         for attr in ("page_url", "url", "question_url", "web_url", "permalink"):
             url = str(getattr(question, attr, "") or "")
@@ -428,6 +436,12 @@ def _get_tournament_id(question: MetaculusQuestion) -> str:
                 if len(parts) > 1:
                     tid = parts[1].split("/")[0]
                     return tid.lower()
+
+        # Fallback: search string representations for known tournament markers
+        question_text = str(question).lower()
+        for marker in ("minibench", "market-pulse", "market-pulse-26q2", "market_pulse"):
+            if marker in question_text:
+                return marker
     except Exception:
         pass
     return ""
