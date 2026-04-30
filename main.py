@@ -30,6 +30,8 @@ from forecasting_tools import (
     ReasonedPrediction,
     clean_indents,
     structure_output,
+    AskNewsSearcher,
+    SmartSearcher,
 )
 from tavily import TavilyClient
 
@@ -39,6 +41,8 @@ from tavily import TavilyClient
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 TINYFISH_API_KEY = os.getenv("TINYFISH_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+ASKNEWS_API_KEY = os.getenv("ASKNEWS_API_KEY")
+SMART_SEARCHER_API_KEY = os.getenv("SMART_SEARCHER_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,10 +82,11 @@ REQUIRE_RESEARCH = os.getenv("REQUIRE_RESEARCH", "true").lower() in ("1", "true"
 CALIBRATION_LOG_FILE = "forecasting_calibration_log.jsonl"
 
 # FIX 8 – single source of truth for committee models
+# FIX 17 – replaced gpt-5-perplexity with actual Perplexity online model
 COMMITTEE_MODELS: List[str] = [
     "openrouter/openai/gpt-5.4",
     "openrouter/openai/gpt-5-search",
-    "openrouter/openai/gpt-5-perplexity",
+    "openrouter/perplexity/sonar-pro",
     "openrouter/anthropic/claude-sonnet-4.6",
 ]
 
@@ -368,7 +373,8 @@ def derive_numeric_fallback_percentiles(
 
 def format_research_block(research_by_source: Dict[str, str]) -> str:
     blocks: List[str] = []
-    for src in ["tavily", "tinyfish", "openrouter_search", "openrouter_perplexity"]:
+    # FIX 17 – updated sources to include asknews and smart_searcher, replaced openrouter_perplexity with perplexity
+    for src in ["tavily", "tinyfish", "openrouter_search", "perplexity", "asknews", "smart_searcher"]:
         txt = (research_by_source or {}).get(src, "") or ""
         if txt.strip():
             blocks.append(f"--- SOURCE {src.upper()} ---\n{txt}\n")
@@ -434,6 +440,39 @@ def build_comment(
     **Searchers used:** {searchers}
     **Models used:** {models}
     """).strip()
+
+
+# ---------------------------------------------------------------------------
+# Tournament detection for conservative forecasting strategy
+# ---------------------------------------------------------------------------
+
+def _get_tournament_id(question: MetaculusQuestion) -> str:
+    """FIX 18 – Extract tournament ID from question for conservative forecast logic."""
+    try:
+        # Try common tournament attributes
+        for attr in ("tournament_id", "tournament", "group_id", "group"):
+            val = getattr(question, attr, None)
+            if val:
+                return str(val).lower()
+        
+        # Try to extract from URL
+        for attr in ("page_url", "url", "question_url", "web_url", "permalink"):
+            url = str(getattr(question, attr, "") or "")
+            if "/tournament/" in url:
+                parts = url.split("/tournament/")
+                if len(parts) > 1:
+                    tid = parts[1].split("/")[0]
+                    return tid.lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_aggressive_tournament(question: MetaculusQuestion) -> bool:
+    """FIX 18 – Return True if question is from minibench or market-pulse (allow aggressive forecasts)."""
+    tid = _get_tournament_id(question)
+    aggressive_tournaments = ["minibench", "market-pulse", "market_pulse"]
+    return any(aggressive in tid for aggressive in aggressive_tournaments)
 
 
 # ---------------------------------------------------------------------------
@@ -514,13 +553,16 @@ class Tude(ForecastBot):
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
         self.tinyfish_api_key = TINYFISH_API_KEY
         self.openrouter_api_key = OPENROUTER_API_KEY
+        # FIX 17 – initialize asknews and smart-searcher
+        self.asknews = AskNewsSearcher(api_key=ASKNEWS_API_KEY) if ASKNEWS_API_KEY else None
+        self.smart_searcher = SmartSearcher(api_key=SMART_SEARCHER_API_KEY) if SMART_SEARCHER_API_KEY else None
         # FIX 6 – keyed by stable question URL, not potentially-"unknown" ID string
         self._research_meta: Dict[str, Dict[str, Any]] = {}
 
-        if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key or self.openrouter_api_key):
+        if REQUIRE_RESEARCH and not (self.tavily_client or self.tinyfish_api_key or self.openrouter_api_key or self.asknews or self.smart_searcher):
             raise RuntimeError(
                 "REQUIRE_RESEARCH=true but no research providers are configured. "
-                "Set TAVILY_API_KEY, TINYFISH_API_KEY, and/or OPENROUTER_API_KEY."
+                "Set TAVILY_API_KEY, TINYFISH_API_KEY, OPENROUTER_API_KEY, ASKNEWS_API_KEY, and/or SMART_SEARCHER_API_KEY."
             )
 
     # -------------------------------------------------------------------------
@@ -644,6 +686,64 @@ class Tude(ForecastBot):
                     await _tinyfish_backoff_async(attempt)
         return last_err
 
+    async def call_asknews_async(self, query: str) -> str:
+        """FIX 17 – Call AskNews searcher in parallel."""
+        if not self.asknews:
+            return ""
+        try:
+            results = await asyncio.to_thread(self.asknews.search, query)
+            if not results:
+                return ""
+            lines: List[str] = []
+            for item in (results if isinstance(results, list) else [results])[:10]:
+                if isinstance(item, dict):
+                    title = (item.get("title") or "").strip()
+                    snippet = (item.get("snippet") or item.get("description") or "").strip()
+                    url = (item.get("url") or "").strip()
+                    source = (item.get("source") or "").strip()
+                else:
+                    title = getattr(item, "title", "")
+                    snippet = getattr(item, "snippet", None) or getattr(item, "description", "")
+                    url = getattr(item, "url", "")
+                    source = getattr(item, "source", "")
+                if title or snippet:
+                    lines.append(
+                        f"- {title + ': ' if title else ''}{snippet}\n"
+                        f"  Source: {source or url or 'N/A'}"
+                    )
+            return "\n".join(lines).strip()
+        except Exception as exc:
+            return f"AskNews error: {exc}"
+
+    async def call_smart_searcher_async(self, query: str) -> str:
+        """FIX 17 – Call SmartSearcher in parallel."""
+        if not self.smart_searcher:
+            return ""
+        try:
+            results = await asyncio.to_thread(self.smart_searcher.search, query)
+            if not results:
+                return ""
+            lines: List[str] = []
+            for item in (results if isinstance(results, list) else [results])[:10]:
+                if isinstance(item, dict):
+                    title = (item.get("title") or "").strip()
+                    snippet = (item.get("snippet") or item.get("description") or "").strip()
+                    url = (item.get("url") or "").strip()
+                    source = (item.get("source") or "").strip()
+                else:
+                    title = getattr(item, "title", "")
+                    snippet = getattr(item, "snippet", None) or getattr(item, "description", "")
+                    url = getattr(item, "url", "")
+                    source = getattr(item, "source", "")
+                if title or snippet:
+                    lines.append(
+                        f"- {title + ': ' if title else ''}{snippet}\n"
+                        f"  Source: {source or url or 'N/A'}"
+                    )
+            return "\n".join(lines).strip()
+        except Exception as exc:
+            return f"SmartSearcher error: {exc}"
+
     # -------------------------------------------------------------------------
     # Query expansion
     # -------------------------------------------------------------------------
@@ -745,10 +845,23 @@ class Tude(ForecastBot):
                 return q, (raw or "").strip()
 
             async def _fetch_openrouter_perplexity(q: str) -> Tuple[str, str]:
+                # FIX 17 – use actual Perplexity online model
                 raw = await with_timeout(
-                    self.call_openrouter_async(q, "openrouter/openai/gpt-5-perplexity"),
+                    self.call_openrouter_async(q, "openrouter/perplexity/sonar-pro"),
                     RESEARCH_TIMEOUT_S,
-                    f"openrouter_perplexity:{q[:40]}",
+                    f"perplexity:{q[:40]}",
+                )
+                return q, (raw or "").strip()
+
+            async def _fetch_asknews(q: str) -> Tuple[str, str]:
+                raw = await with_timeout(
+                    self.call_asknews_async(q), RESEARCH_TIMEOUT_S, f"asknews:{q[:40]}"
+                )
+                return q, (raw or "").strip()
+
+            async def _fetch_smart_searcher(q: str) -> Tuple[str, str]:
+                raw = await with_timeout(
+                    self.call_smart_searcher_async(q), RESEARCH_TIMEOUT_S, f"smart_searcher:{q[:40]}"
                 )
                 return q, (raw or "").strip()
 
@@ -756,18 +869,24 @@ class Tude(ForecastBot):
             tni_coros = [_fetch_tinyfish(q) for q in queries]
             ors_coros = [_fetch_openrouter_search(q) for q in queries]
             orp_coros = [_fetch_openrouter_perplexity(q) for q in queries]
+            asn_coros = [_fetch_asknews(q) for q in queries]
+            sms_coros = [_fetch_smart_searcher(q) for q in queries]
             all_results = await asyncio.gather(
-                *tav_coros, *tni_coros, *ors_coros, *orp_coros, return_exceptions=True
+                *tav_coros, *tni_coros, *ors_coros, *orp_coros, *asn_coros, *sms_coros, return_exceptions=True
             )
 
             tav_parts: List[str] = []
             tni_parts: List[str] = []
             ors_parts: List[str] = []
             orp_parts: List[str] = []
+            asn_parts: List[str] = []
+            sms_parts: List[str] = []
             tav_errs: List[str] = []
             tni_errs: List[str] = []
             ors_errs: List[str] = []
             orp_errs: List[str] = []
+            asn_errs: List[str] = []
+            sms_errs: List[str] = []
 
             idx = 0
             for res in all_results[idx: idx + max_queries]:
@@ -812,20 +931,46 @@ class Tude(ForecastBot):
                 if is_meaningful_research_text(raw):
                     orp_parts.append(f"## Query: {q}\n{raw}")
                 elif raw:
-                    orp_errs.append(f"[openrouter_perplexity] {raw[:500]}")
+                    orp_errs.append(f"[perplexity] {raw[:500]}")
+
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
+                if isinstance(res, Exception):
+                    asn_errs.append(str(res))
+                    continue
+                q, raw = res
+                if is_meaningful_research_text(raw):
+                    asn_parts.append(f"## Query: {q}\n{raw}")
+                elif raw:
+                    asn_errs.append(f"[asknews] {raw[:500]}")
+
+            for res in all_results[idx: idx + max_queries]:
+                idx += max_queries
+                if isinstance(res, Exception):
+                    sms_errs.append(str(res))
+                    continue
+                q, raw = res
+                if is_meaningful_research_text(raw):
+                    sms_parts.append(f"## Query: {q}\n{raw}")
+                elif raw:
+                    sms_errs.append(f"[smart_searcher] {raw[:500]}")
 
             tav_all = "\n\n".join(tav_parts).strip()
             tni_all = "\n\n".join(tni_parts).strip()
             ors_all = "\n\n".join(ors_parts).strip()
             orp_all = "\n\n".join(orp_parts).strip()
+            asn_all = "\n\n".join(asn_parts).strip()
+            sms_all = "\n\n".join(sms_parts).strip()
             research_by_source = {
                 "tavily": tav_all,
                 "tinyfish": tni_all,
                 "openrouter_search": ors_all,
-                "openrouter_perplexity": orp_all,
+                "perplexity": orp_all,
+                "asknews": asn_all,
+                "smart_searcher": sms_all,
             }
             searchers_used = [
-                s for s in ["tavily", "tinyfish", "openrouter_search", "openrouter_perplexity"]
+                s for s in ["tavily", "tinyfish", "openrouter_search", "perplexity", "asknews", "smart_searcher"]
                 if is_meaningful_research_text(research_by_source.get(s, ""))
             ]
 
@@ -839,15 +984,22 @@ class Tude(ForecastBot):
                 if ors_errs:
                     diag.append("OpenRouter search diagnostics:\n" + "\n".join(ors_errs[:4]))
                 if orp_errs:
-                    diag.append("OpenRouter perplexity diagnostics:\n" + "\n".join(orp_errs[:4]))
+                    diag.append("Perplexity diagnostics:\n" + "\n".join(orp_errs[:4]))
+                if asn_errs:
+                    diag.append("AskNews diagnostics:\n" + "\n".join(asn_errs[:4]))
+                if sms_errs:
+                    diag.append("SmartSearcher diagnostics:\n" + "\n".join(sms_errs[:4]))
                 diag_text = ("\n\n".join(diag)).strip() or "No provider output captured."
                 raise RuntimeError(
                     f"Insufficient research for Q{qid}; refusing to forecast. "
                     f"Providers configured: tavily={'yes' if TAVILY_API_KEY else 'no'}, "
                     f"tinyfish={'yes' if self.tinyfish_api_key else 'no'}, "
-                    f"openrouter={'yes' if self.openrouter_api_key else 'no'}. "
+                    f"openrouter={'yes' if self.openrouter_api_key else 'no'}, "
+                    f"asknews={'yes' if self.asknews else 'no'}, "
+                    f"smart_searcher={'yes' if self.smart_searcher else 'no'}. "
                     f"Research lengths: tavily={len(tav_all)}, tinyfish={len(tni_all)}, "
-                    f"openrouter_search={len(ors_all)}, openrouter_perplexity={len(orp_all)}.\n\n"
+                    f"openrouter_search={len(ors_all)}, perplexity={len(orp_all)}, "
+                    f"asknews={len(asn_all)}, smart_searcher={len(sms_all)}.\n\n"
                     f"{diag_text}"
                 )
 
@@ -1262,11 +1414,26 @@ class Tude(ForecastBot):
         # Enforce minibench extremization behavior: avoid weak middle forecasts.
         # If the committee is aligned and the aggregate is near 50%, push to
         # a decisive extreme. Otherwise, fall back to an honest 50/50.
-        if 0.45 <= p_final <= 0.55:
-            if agree and p_agg != 0.5:
-                p_final = 0.02 if p_agg < 0.5 else 0.98
-            else:
+        # FIX 18 – apply conservative adjustments for non-minibench tournaments
+        is_aggressive = _is_aggressive_tournament(question)
+        if is_aggressive:
+            # Minibench / Market Pulse: extremize middle forecasts
+            if 0.45 <= p_final <= 0.55:
+                if agree and p_agg != 0.5:
+                    p_final = 0.02 if p_agg < 0.5 else 0.98
+                else:
+                    p_final = 0.50
+        else:
+            # Other tournaments: conservative adjustments
+            # Dampen extremization and blend more strongly with crowd/base rate
+            if 0.45 <= p_final <= 0.55:
                 p_final = 0.50
+            else:
+                # Pull extreme forecasts back toward 50% (more conservative)
+                if p_final > 0.5:
+                    p_final = clamp01(0.5 + (p_final - 0.5) * 0.7)
+                else:
+                    p_final = clamp01(0.5 - (0.5 - p_final) * 0.7)
 
         meta = self._research_meta.get(_question_key(question), {})
         searchers_used: List[str] = meta.get("searchers_used", []) if isinstance(meta.get("searchers_used"), list) else []
@@ -1328,6 +1495,14 @@ class Tude(ForecastBot):
         floor = max(1e-6, 0.01 / len(option_list))
         med = np.maximum(med, floor)
         med = med / med.sum()
+
+        # FIX 18 – apply conservative adjustments for non-minibench tournaments
+        is_aggressive = _is_aggressive_tournament(question)
+        if not is_aggressive:
+            # Conservative: dampen strong predictions, blend toward uniform distribution
+            uniform = np.array([1.0 / len(option_list)] * len(option_list))
+            med = clamp01(0.7 * med + 0.3 * uniform)
+            med = med / med.sum()
 
         # FIX 12 – use PredictedOption directly
         out = PredictedOptionList(
@@ -1401,6 +1576,25 @@ class Tude(ForecastBot):
         validated = enforce_numeric_constraints(aggregated, question)
         if not validated or len(validated) != 6:
             validated = derive_numeric_fallback_percentiles(question, base)
+
+        # FIX 18 – apply conservative adjustments for non-minibench tournaments
+        is_aggressive = _is_aggressive_tournament(question)
+        if not is_aggressive and isinstance(base, (int, float)):
+            # Conservative: narrow distribution around base rate estimate
+            validated_conserv = []
+            base_val = float(base)
+            for p in validated:
+                if p.percentile < 0.5:
+                    # For lower percentiles, increase toward base (less extreme)
+                    new_val = p.value + (base_val - p.value) * 0.3
+                    validated_conserv.append(Percentile(percentile=p.percentile, value=new_val))
+                elif p.percentile > 0.5:
+                    # For upper percentiles, decrease toward base (less extreme)
+                    new_val = p.value + (base_val - p.value) * 0.3
+                    validated_conserv.append(Percentile(percentile=p.percentile, value=new_val))
+                else:
+                    validated_conserv.append(p)
+            validated = enforce_numeric_constraints(validated_conserv, question)
 
         dist = NumericDistribution.from_question(validated, question)
 
