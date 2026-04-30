@@ -1626,9 +1626,9 @@ if __name__ == "__main__":
 
     client = MetaculusClient()
     default_ids = list(dict.fromkeys([
-        "32916",
+        "33022",
         "minibench",
-        "market-pulse-26q1",
+        "33013",
         getattr(client, "CURRENT_MINIBENCH_ID", "minibench"),
     ]))
     tournament_ids = args.tournament_ids or default_ids
